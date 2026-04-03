@@ -6,7 +6,7 @@
 
 #pragma once
 
-#define ZRQUEUE_VERSION 10002 // 1.0.2
+#define ZRQUEUE_VERSION 10003 // 1.0.3
 
 #include <atomic>
 #include <cassert>
@@ -144,11 +144,13 @@ namespace zrqueue {
         template <class U> constexpr AlignedAllocator(const AlignedAllocator<U, Alignment>&) noexcept {}
 
         T* allocate(std::size_t n) {
-            if (n == 0) return nullptr;
+            if (n == 0) {
+                return nullptr;
+            }
             size_t raw_size = n * sizeof(T);
             // 【核心防御】：将分配大小向上取整到缓存行的倍数，操作系统绝不会在尾巴上塞无关变量
             size_t aligned_size = align_up(raw_size, Alignment);
-            void* ptr = nullptr;
+            void *ptr = nullptr;
 
 #if defined(ZRQUEUE_OS_WINDOWS)
             ptr = _aligned_malloc(aligned_size, Alignment);
@@ -281,7 +283,7 @@ namespace zrqueue {
             static_assert(std::is_constructible<T, Args&&...>::value, "T must be constructible with Args&&...");
 
             auto const write_index = write_index_.load(std::memory_order_relaxed);
-            auto next_write_index = write_index + 1;
+            auto next_write_index  = write_index + 1;
 
             // 【机制】：仅在本地缓存认为满了时，才跨核拉取最新消费者索引 (Cache Ping-Pong 防御)
             while (ZRQUEUE_UNLIKELY(next_write_index - cached_read_index_ > capacity_)) {
@@ -298,7 +300,7 @@ namespace zrqueue {
             static_assert(std::is_constructible<T, Args&&...>::value, "T must be constructible with Args&&...");
 
             auto const write_index = write_index_.load(std::memory_order_relaxed);
-            auto next_write_index = write_index + 1;
+            auto next_write_index  = write_index + 1;
 
             if (ZRQUEUE_UNLIKELY(next_write_index - cached_read_index_ > capacity_)) {
                 cached_read_index_ = read_index_.load(std::memory_order_acquire);
@@ -364,27 +366,29 @@ namespace zrqueue {
             return write_index_.load(std::memory_order_acquire) == read_index_.load(std::memory_order_acquire);
         }
 
-        size_t capacity() const noexcept { return capacity_; }
+        size_t capacity() const noexcept { 
+            return capacity_; 
+        }
 
     private:
         // ========================================================================
         // 【物理内存布局】: 教科书级的伪共享隔离方案 (Cache Coherence Ping-Pong Defense)
         // ========================================================================
 
-        // 【缓存行 1】：生产者专区。写线程疯狂操作，读线程偶尔读取。
+        // 【缓存行】：生产者专区。写线程疯狂操作，读线程偶尔读取
         alignas(ZRQUEUE_CACHE_LINE_SIZE) std::atomic<uint64_t> write_index_{ 0 };
-        uint64_t cached_read_index_{ 0 };
+        alignas(ZRQUEUE_CACHE_LINE_SIZE) uint64_t cached_read_index_{ 0 };
 
-        // 【缓存行 2】：消费者专区。读线程疯狂操作，写线程偶尔读取。
+        // 【缓存行】：消费者专区。读线程疯狂操作，写线程偶尔读取
         alignas(ZRQUEUE_CACHE_LINE_SIZE) std::atomic<uint64_t> read_index_{ 0 };
-        uint64_t cached_write_index_{ 0 };
+        alignas(ZRQUEUE_CACHE_LINE_SIZE) uint64_t cached_write_index_{ 0 };
 
-        // 【缓存行 3】：冷数据区。盘中绝对不变的元数据，远离热点指针区。
+        // 【缓存行】：冷数据区。盘中绝对不变的元数据，远离热点指针区
         alignas(ZRQUEUE_CACHE_LINE_SIZE) uint32_t capacity_ { 0 };
         uint32_t mask_{ 0 };
         T* slots_{ nullptr };
 
-        // 【缓存行 4/末尾】：分配器占据独立空间
+        // 【缓存行 末尾】：分配器占据独立空间
         alignas(ZRQUEUE_CACHE_LINE_SIZE) Allocator allocator_ {};
     };
 
