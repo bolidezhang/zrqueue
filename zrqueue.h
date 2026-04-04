@@ -276,7 +276,6 @@ namespace zrqueue {
     template <class T, class U> bool operator==(const HugePageAllocator<T>&, const HugePageAllocator<U>&) { return true; }
     template <class T, class U> bool operator!=(const HugePageAllocator<T>&, const HugePageAllocator<U>&) { return false; }
 
-
     // ============================================================================
     // [极速核心无锁队列 SPSCQueue]
     // ============================================================================
