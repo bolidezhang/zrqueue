@@ -410,7 +410,7 @@ namespace zrqueue {
         uint32_t mask_{ 0 };
         T* slots_{ nullptr };
 
-        // 【缓存行 末尾】：分配器占据独立空间
+        // 【缓存行】：分配器占据独立空间
         alignas(ZRQUEUE_CACHE_LINE_SIZE) Allocator allocator_ {};
     };
 
