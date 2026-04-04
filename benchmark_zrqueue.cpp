@@ -1,4 +1,7 @@
-﻿#include "zrqueue.h"
+﻿// zrqueue Benchmark Test
+// Compile: g++ -O3 -std=c++17 -march=native -pthread benchmark_zrqueue.cpp -o benchmark_zrqueue
+
+#include "zrqueue.h"
 #include <chrono>
 #include <iostream>
 #include <thread>
