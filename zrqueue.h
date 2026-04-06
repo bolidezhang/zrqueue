@@ -46,15 +46,15 @@ SOFTWARE.
  // [平台与系统底层 API 探测]
  // ============================================================================
 #if defined(_MSC_VER) || defined(__MINGW32__)
-#define ZRQUEUE_OS_WINDOWS 1
-#include <windows.h>
-#include <memoryapi.h>
-#include <malloc.h>
+    #define ZRQUEUE_OS_WINDOWS 1
+    #include <windows.h>
+    #include <memoryapi.h>
+    #include <malloc.h>
 #elif defined(__linux__) || defined(__APPLE__)
-#define ZRQUEUE_OS_POSIX 1
-#include <sys/mman.h>
-#include <unistd.h>
-#include <fcntl.h>
+    #define ZRQUEUE_OS_POSIX 1
+    #include <sys/mman.h>
+    #include <unistd.h>
+    #include <fcntl.h>
 #endif
 
 #ifndef MAP_HUGETLB
@@ -160,10 +160,13 @@ namespace zrqueue {
     template <typename T, size_t Alignment = ZRQUEUE_CACHE_LINE_SIZE>
     struct AlignedAllocator {
         using value_type = T;
-        template <class U> struct rebind { using other = AlignedAllocator<U, Alignment>; };
+        template <class U> struct rebind { 
+            using other = AlignedAllocator<U, Alignment>; 
+        };
 
         AlignedAllocator() noexcept = default;
-        template <class U> constexpr AlignedAllocator(const AlignedAllocator<U, Alignment>&) noexcept {}
+        template <class U> constexpr AlignedAllocator(const AlignedAllocator<U, Alignment>&) noexcept {
+        }
 
         T* allocate(std::size_t n) {
             if (n == 0) {
@@ -207,17 +210,20 @@ namespace zrqueue {
     template <typename T>
     struct HugePageAllocator {
         using value_type = T;
-        template <class U> struct rebind { using other = HugePageAllocator<U>; };
+        template <class U> struct rebind { 
+            using other = HugePageAllocator<U>; 
+        };
 
         HugePageAllocator() noexcept = default;
-        template <class U> constexpr HugePageAllocator(const HugePageAllocator<U>&) noexcept {}
+        template <class U> constexpr HugePageAllocator(const HugePageAllocator<U>&) noexcept {
+        }
 
         T* allocate(std::size_t n) {
             if (n == 0) {
                 return nullptr;
             }
             size_t raw_size = n * sizeof(T);
-            void* ptr = nullptr;
+            void *ptr = nullptr;
             size_t hp_size = get_hugepage_size();
 
 #if defined(ZRQUEUE_OS_POSIX)
@@ -271,10 +277,18 @@ namespace zrqueue {
     };
 
     // 分配器比较
-    template <class T, class U, size_t A> bool operator==(const AlignedAllocator<T, A>&, const AlignedAllocator<U, A>&) { return true; }
-    template <class T, class U, size_t A> bool operator!=(const AlignedAllocator<T, A>&, const AlignedAllocator<U, A>&) { return false; }
-    template <class T, class U> bool operator==(const HugePageAllocator<T>&, const HugePageAllocator<U>&) { return true; }
-    template <class T, class U> bool operator!=(const HugePageAllocator<T>&, const HugePageAllocator<U>&) { return false; }
+    template <class T, class U, size_t A> bool operator==(const AlignedAllocator<T, A>&, const AlignedAllocator<U, A>&) { 
+        return true; 
+    }
+    template <class T, class U, size_t A> bool operator!=(const AlignedAllocator<T, A>&, const AlignedAllocator<U, A>&) { 
+        return false; 
+    }
+    template <class T, class U> bool operator==(const HugePageAllocator<T>&, const HugePageAllocator<U>&) { 
+        return true; 
+    }
+    template <class T, class U> bool operator!=(const HugePageAllocator<T>&, const HugePageAllocator<U>&) { 
+        return false; 
+    }
 
     // ============================================================================
     // [极速核心无锁队列 SPSCQueue]
