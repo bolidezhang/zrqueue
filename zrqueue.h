@@ -792,7 +792,7 @@ namespace zrqueue {
         // 1. alignas(ZRQUEUE_CACHE_LINE_SIZE) 强制数据区的首地址与上方的索引区彻底物理切断。
         // 2. alignas(T) 确保强制类型转换 reinterpret_cast<T*> 是对齐安全的。
         // 3. std::byte 确保这是一块不调用任何构造函数的“纯粹垃圾内存”，仅在 push 时现场构造。
-        alignas(ZRQUEUE_CACHE_LINE_SIZE) alignas(T) std::byte slots_memory_[N * sizeof(T)];
+        alignas(ZRQUEUE_CACHE_LINE_SIZE) alignas(T) char slots_memory_[N * sizeof(T)];
     };
 
 }  // namespace zrqueue
