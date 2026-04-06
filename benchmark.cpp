@@ -55,6 +55,8 @@ int main(int argc, char* argv[]) {
     const size_t queueSize = 10000000;
     const int64_t iters = 10000000;
 
+    zrqueue::SPSCStaticQueue<int, 128> q_test;
+
     std::cout << "\nrigtorp::SPSCQueue:" << std::endl;
     {
         rigtorp::SPSCQueue<int> q(queueSize);
