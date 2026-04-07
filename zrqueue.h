@@ -318,7 +318,7 @@ namespace zrqueue {
     }
 
     // ============================================================================
-    // [极速核心无锁队列 SPSCQueue]
+    // [极速无锁队列 SPSCQueue]
     // ============================================================================
     template <typename T, typename Allocator = AlignedAllocator<T, ZRQUEUE_CACHE_LINE_SIZE>>
     class SPSCQueue {
@@ -590,10 +590,6 @@ namespace zrqueue {
         SPSCStaticQueue(const SPSCStaticQueue&) = delete;
         SPSCStaticQueue& operator=(const SPSCStaticQueue&) = delete;
 
-        // ========================================================================
-        // 生产者 API
-        // ========================================================================
-
         template <typename... Args>
         void emplace(Args&&... args) noexcept(std::is_nothrow_constructible<T, Args&&...>::value) {
             static_assert(std::is_constructible<T, Args&&...>::value, "T must be constructible with Args&&...");
@@ -636,10 +632,6 @@ namespace zrqueue {
             return try_emplace(v);
         }
 
-        /**
-         * @brief 批量写入 (Bulk Push)
-         * @return 实际写入的元素个数
-         */
         template <typename Iterator>
         size_t push_bulk(Iterator first, size_t count) noexcept {
             if (count == 0) {
@@ -647,12 +639,13 @@ namespace zrqueue {
             }
 
             auto const write_index = write_index_.load(std::memory_order_relaxed);
-
             if (ZRQUEUE_UNLIKELY(write_index + count - cached_read_index_ > N)) {
                 cached_read_index_ = read_index_.load(std::memory_order_acquire);
                 if (write_index + count - cached_read_index_ > N) {
                     count = N - (write_index - cached_read_index_);
-                    if (count == 0) return 0;
+                    if (count == 0) {
+                        return 0;
+                    }
                 }
             }
 
@@ -665,10 +658,6 @@ namespace zrqueue {
             return count;
         }
 
-        // ========================================================================
-        // 消费者 API
-        // ========================================================================
-
         T* front() noexcept {
             auto const read_index = read_index_.load(std::memory_order_relaxed);
             if (read_index == cached_write_index_) {
@@ -680,24 +669,18 @@ namespace zrqueue {
             return &reinterpret_cast<T*>(slots_memory_)[read_index & MASK];
         }
 
-        // 允许查看当前读取游标往后 offset 位置的元素，但不移动游标
         T* peek(size_t offset = 0) noexcept {
             auto const read_index = read_index_.load(std::memory_order_relaxed);
 
-            // 确保加上 offset 后，依然没有越过生产者写入的位置
             if (read_index + offset >= cached_write_index_) {
                 cached_write_index_ = write_index_.load(std::memory_order_acquire);
                 if (read_index + offset >= cached_write_index_) {
-                    return nullptr; // 没有那么多数据
+                    return nullptr;
                 }
             }
-            return &reinterpret_cast<T*>(slots_memory_)[(read_index + offset) & mask_];
+            return &reinterpret_cast<T*>(slots_memory_)[(read_index + offset) & MASK];
         }
 
-        /**
-         * @brief 极速自旋读取 (Spin Front with Hardware Pause)
-         * @return 必定返回非空数据指针
-         */
         T* spin_front() noexcept {
             while (true) {
                 auto const read_index = read_index_.load(std::memory_order_relaxed);
@@ -710,7 +693,6 @@ namespace zrqueue {
                     return &reinterpret_cast<T*>(slots_memory_)[read_index & MASK];
                 }
 
-                // 底层防御：防止 CPU 烧毁与降频
                 ZRQUEUE_CPU_PAUSE();
             }
         }
@@ -726,12 +708,6 @@ namespace zrqueue {
             read_index_.store(read_index + 1, std::memory_order_release);
         }
 
-        /**
-         * @brief 批量零拷贝消费 (Bulk Consume)
-         * @param handler 接收 T& 的 lambda 表达式
-         * @param max_count 0 表示有多少吃多少
-         * @return 实际处理的元素个数
-         */
         template <typename TfnHandler>
         size_t consume_bulk(TfnHandler&& handler, size_t max_count = 0) noexcept {
             auto const read_index = read_index_.load(std::memory_order_relaxed);
@@ -757,10 +733,6 @@ namespace zrqueue {
             return count_to_consume;
         }
 
-        // ========================================================================
-        // 状态查询
-        // ========================================================================
-
         size_t size() const noexcept {
             uint64_t w = write_index_.load(std::memory_order_acquire);
             uint64_t r = read_index_.load(std::memory_order_acquire);
@@ -771,14 +743,12 @@ namespace zrqueue {
             return write_index_.load(std::memory_order_acquire) == read_index_.load(std::memory_order_acquire);
         }
 
-        constexpr size_t capacity() const noexcept { return N; }
+        constexpr size_t capacity() const noexcept { 
+            return N; 
+        }
 
     private:
         static constexpr uint32_t MASK = N - 1;
-
-        // ========================================================================
-        // 【物理内存布局】: 教科书级的伪共享隔离方案 (Cache Coherence Ping-Pong Defense)
-        // ========================================================================
 
         // 【缓存行 1】：生产者专区。
         alignas(ZRQUEUE_CACHE_LINE_SIZE) std::atomic<uint64_t> write_index_{ 0 };

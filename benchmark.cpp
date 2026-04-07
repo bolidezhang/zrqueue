@@ -47,7 +47,7 @@ int main(int argc, char* argv[]) {
     int cpu1 = -1;
     int cpu2 = -1;
 
-    if (argc == 3) {
+    if (argc >= 3) {
         cpu1 = std::atoi(argv[1]);
         cpu2 = std::atoi(argv[2]);
     }
@@ -55,9 +55,9 @@ int main(int argc, char* argv[]) {
     const size_t queueSize = 10000000;
     const int64_t iters = 10000000;
 
-    {
-        zrqueue::SPSCStaticQueue<int, 128> q;
-    }
+    //{
+    //    zrqueue::SPSCStaticQueue<int, 128> q;
+    //}
 
     std::cout << "\nrigtorp::SPSCQueue:" << std::endl;
     {
