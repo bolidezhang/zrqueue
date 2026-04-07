@@ -28,7 +28,7 @@ SOFTWARE.
 
 #pragma once
 
-#define ZRQUEUE_VERSION 10201 // 1.2.1
+#define ZRQUEUE_VERSION 10202 // 1.2.2
 
 #include <atomic>
 #include <cassert>
@@ -745,19 +745,19 @@ namespace zrqueue {
     private:
         static constexpr uint32_t MASK = N - 1;
 
-        // 【缓存行 1】：生产者专区。
+        // 【缓存行】：生产者专区。
         alignas(ZRQUEUE_CACHE_LINE_SIZE) std::atomic<uint64_t> write_index_{ 0 };
         alignas(ZRQUEUE_CACHE_LINE_SIZE) uint64_t cached_read_index_ { 0 };
 
-        // 【缓存行 2】：消费者专区。
+        // 【缓存行】：消费者专区。
         alignas(ZRQUEUE_CACHE_LINE_SIZE) std::atomic<uint64_t> read_index_{ 0 };
         alignas(ZRQUEUE_CACHE_LINE_SIZE) uint64_t cached_write_index_ { 0 };
 
-        // 【缓存行 3】：纯内嵌数据区 (In-place Memory Array)
+        // 【缓存行】：纯内嵌数据区 (In-place Memory Array)
         // 1. alignas(ZRQUEUE_CACHE_LINE_SIZE) 强制数据区的首地址与上方的索引区彻底物理切断。
         // 2. alignas(T) 确保强制类型转换 reinterpret_cast<T*> 是对齐安全的。
-        // 3. std::byte 确保这是一块不调用任何构造函数的“纯粹垃圾内存”，仅在 push 时现场构造。
-        alignas(ZRQUEUE_CACHE_LINE_SIZE) alignas(T) char slots_memory_[N * sizeof(T)];
+        // 3. unsigned char 确保这是一块不调用任何构造函数的“纯粹垃圾内存”，仅在 push 时现场构造。
+        alignas(ZRQUEUE_CACHE_LINE_SIZE) alignas(T) unsigned char slots_memory_[N * sizeof(T)];
     };
 
 }  // namespace zrqueue

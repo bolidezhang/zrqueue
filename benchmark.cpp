@@ -166,6 +166,5 @@ int main(int argc, char* argv[]) {
             << " ns RTT" << std::endl;
     }
 
-
     return 0;
 }
