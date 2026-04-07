@@ -28,7 +28,7 @@ SOFTWARE.
 
 #pragma once
 
-#define ZRQUEUE_VERSION 10200 // 1.2.0
+#define ZRQUEUE_VERSION 10201 // 1.2.1
 
 #include <atomic>
 #include <cassert>
@@ -250,20 +250,16 @@ namespace zrqueue {
                 return nullptr;
             }
             size_t raw_size = n * sizeof(T);
-            void *ptr = nullptr;
+            void* ptr = nullptr;
             size_t hp_size = get_hugepage_size();
 
 #if defined(ZRQUEUE_OS_POSIX)
             // 【核心防御】：强制向大页大小对齐，防止内核 mmap 越界或分配失败
             size_t aligned_size = align_up(raw_size, hp_size);
-            ptr = mmap(nullptr, aligned_size, PROT_READ | PROT_WRITE,
-                MAP_PRIVATE | MAP_ANONYMOUS | MAP_HUGETLB, -1, 0);
-
+            ptr = mmap(nullptr, aligned_size, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS | MAP_HUGETLB, -1, 0);
             if (ptr == MAP_FAILED) {
-                // 优雅降级：退回普通 4KB 内存页
-                size_t page_size = sysconf(_SC_PAGESIZE);
-                ptr = mmap(nullptr, align_up(raw_size, page_size), PROT_READ | PROT_WRITE,
-                    MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+                // 大页失败，降级为普通 mmap，但仍使用相同的 alignment 对齐
+                ptr = mmap(nullptr, aligned_size, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
                 if (ptr == MAP_FAILED) {
                     throw std::bad_alloc();
                 }
@@ -271,15 +267,13 @@ namespace zrqueue {
 #elif defined(ZRQUEUE_OS_WINDOWS)
             if (hp_size > 1) {
                 size_t aligned_size = align_up(raw_size, hp_size);
-                ptr = VirtualAlloc(NULL, aligned_size,
-                    MEM_COMMIT | MEM_RESERVE | MEM_LARGE_PAGES, PAGE_READWRITE);
+                ptr = VirtualAlloc(NULL, aligned_size, MEM_COMMIT | MEM_RESERVE | MEM_LARGE_PAGES, PAGE_READWRITE);
             }
             if (!ptr) {
-                // 优雅降级
+                // 优雅降级:退回普通 4KB 内存页
                 SYSTEM_INFO sys_info;
                 GetSystemInfo(&sys_info);
-                ptr = VirtualAlloc(NULL, align_up(raw_size, sys_info.dwPageSize),
-                    MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
+                ptr = VirtualAlloc(NULL, align_up(raw_size, sys_info.dwPageSize), MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
                 if (!ptr) {
                     throw std::bad_alloc();
                 }
@@ -292,8 +286,9 @@ namespace zrqueue {
             if (!p) {
                 return;
             }
-            size_t raw_size = n * sizeof(T);
+
 #if defined(ZRQUEUE_OS_POSIX)
+            size_t raw_size = n * sizeof(T);
             // 释放时同样必须严格按分配时的对齐大小释放，防止内存泄漏
             size_t aligned_size = align_up(raw_size, get_hugepage_size());
             munmap(p, aligned_size);
