@@ -570,7 +570,7 @@ namespace zrqueue {
     class SPSCStaticQueue {
         // 【编译期防御】：强行要求 N 是 2 的次幂，从根源消灭运行期位运算的风险
         static_assert(N >= 2, "Capacity must be at least 2");
-        static_assert((N& (N - 1)) == 0, "Capacity N must be a power of 2 for bitwise masking");
+        static_assert((N & (N - 1)) == 0, "Capacity N must be a power of 2 for bitwise masking");
 
     public:
         SPSCStaticQueue() noexcept = default;
