@@ -137,4 +137,3 @@ cmake --build . --config Release
 
 ## License
 MIT License. Copyright (c) 2024 Bolide Zhang.
-```
