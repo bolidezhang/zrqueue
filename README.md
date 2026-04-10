@@ -1,7 +1,4 @@
-﻿这里是完整的、纯 Markdown 格式的 `README.md` 内容。你可以直接点击右上角的“复制”按钮，保存为 `README.md` 文件。
-
-```markdown
-# zrqueue
+﻿# zrqueue
 
 ## Overview
 `zrqueue` is a wait-free, lock-free, single-producer single-consumer (SPSC) queue library provided as a **single-header** C++17 library. 
