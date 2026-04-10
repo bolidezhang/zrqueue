@@ -40,9 +40,6 @@
     }
 #endif
 
-constexpr size_t QUEUE_SIZE = 10000000;   // 队列容量
-constexpr int64_t ITERS = 10000000;       // 消息数量
-
 int main(int argc, char* argv[]) {
     int cpu1 = -1;
     int cpu2 = -1;
@@ -52,11 +49,13 @@ int main(int argc, char* argv[]) {
         cpu2 = std::atoi(argv[2]);
     }
 
-    const size_t queueSize = 10000000;
-    const int64_t iters = 10000000;
+    constexpr size_t queueSize = 10000000;
+    constexpr size_t queueSize2 = zrqueue::normalize_size(10000000);
+    constexpr int64_t iters = 10000000;
 
     //{
-    //    zrqueue::SPSCStaticQueue<int, 128> q;
+    //    zrqueue::SpscInlineQueue<int, 128> q;
+    //    zrqueue::SpscRingBuffer<int, 64> q1;
     //}
 
     std::cout << "\nrigtorp::SPSCQueue:" << std::endl;
@@ -113,9 +112,9 @@ int main(int argc, char* argv[]) {
             << " ns RTT" << std::endl;
     }
 
-    std::cout << "\nzrqueue::SPSCQueue:" << std::endl;
+    std::cout << "\nzrqueue::SpscQueue:" << std::endl;
     {
-        zrqueue::SPSCQueue<int> q(queueSize);
+        zrqueue::SpscQueue<int> q(queueSize);
         auto t = std::thread([&] {
             pinThread(cpu1);
             for (int i = 0; i < iters; ++i) {
@@ -140,7 +139,7 @@ int main(int argc, char* argv[]) {
             << " ops/ms" << std::endl;
     }
     {
-        zrqueue::SPSCQueue<int> q1(queueSize), q2(queueSize);
+        zrqueue::SpscQueue<int> q1(queueSize), q2(queueSize);
         auto t = std::thread([&] {
             pinThread(cpu1);
             for (int i = 0; i < iters; ++i) {
@@ -162,6 +161,65 @@ int main(int argc, char* argv[]) {
         }
         auto stop = std::chrono::steady_clock::now();
         t.join();
+        std::cout << std::chrono::duration_cast<std::chrono::nanoseconds>(stop - start).count() / iters
+            << " ns RTT" << std::endl;
+    }
+
+    std::cout << "\nzrqueue::SpscInlineQueue:" << std::endl;
+    {
+        auto q = new zrqueue::SpscInlineQueue<int, queueSize2>();
+        auto t = std::thread([&] {
+            pinThread(cpu1);
+            for (int i = 0; i < iters; ++i) {
+                while (!q->front())
+                    ;
+                if (*q->front() != i) {
+                    throw std::runtime_error("");
+                }
+                q->pop();
+            }
+        });
+
+        pinThread(cpu2);
+
+        auto start = std::chrono::steady_clock::now();
+        for (int i = 0; i < iters; ++i) {
+            q->emplace(i);
+        }
+        t.join();
+        auto stop = std::chrono::steady_clock::now();
+        delete q;
+
+        std::cout << iters * 1000000 / std::chrono::duration_cast<std::chrono::nanoseconds>(stop - start).count()
+            << " ops/ms" << std::endl;
+    }
+    {
+        auto q1 = new zrqueue::SpscInlineQueue<int, queueSize2>();
+        auto q2 = new zrqueue::SpscInlineQueue<int, queueSize2>();
+        auto t = std::thread([&] {
+            pinThread(cpu1);
+            for (int i = 0; i < iters; ++i) {
+                while (!q1->front())
+                    ;
+                q2->emplace(*q1->front());
+                q1->pop();
+            }
+        });
+
+        pinThread(cpu2);
+
+        auto start = std::chrono::steady_clock::now();
+        for (int i = 0; i < iters; ++i) {
+            q1->emplace(i);
+            while (!q2->front())
+                ;
+            q2->pop();
+        }
+        auto stop = std::chrono::steady_clock::now();
+        t.join();
+        delete q1;
+        delete q2;
+
         std::cout << std::chrono::duration_cast<std::chrono::nanoseconds>(stop - start).count() / iters
             << " ns RTT" << std::endl;
     }

@@ -28,9 +28,10 @@ SOFTWARE.
 
 #pragma once
 
-#define ZRQUEUE_VERSION 10202 // 1.2.2
+#define ZRQUEUE_VERSION 10401 // 1.4.1
 
 #include <atomic>
+#include <array>
 #include <cassert>
 #include <cstdlib>
 #include <cstdio>
@@ -57,6 +58,15 @@ SOFTWARE.
     #include <fcntl.h>
 #endif
 
+#ifdef __has_cpp_attribute
+#if __has_cpp_attribute(nodiscard)
+#define ZRQUEUE_NODISCARD [[nodiscard]]
+#endif
+#endif
+#ifndef ZRQUEUE_NODISCARD
+#define ZRQUEUE_NODISCARD
+#endif
+
 #ifndef MAP_HUGETLB
 #define MAP_HUGETLB 0x40000 
 #endif
@@ -67,14 +77,14 @@ SOFTWARE.
 // ============================================================================
 // [编译器宏]
 // ============================================================================
-// 1. 获取 CPU L1 缓存行大小 (防伪共享核心参数)
+// 获取 CPU L1 缓存行大小 (防伪共享核心参数)
 #ifdef __cpp_lib_hardware_interference_size
 inline constexpr size_t ZRQUEUE_CACHE_LINE_SIZE = std::hardware_destructive_interference_size;
 #else
 inline constexpr size_t ZRQUEUE_CACHE_LINE_SIZE = 64;
 #endif
 
-// 2. 静态分支预测 (将极小概率事件踢出 CPU 指令预取流水线)
+// 静态分支预测 (将极小概率事件踢出 CPU 指令预取流水线)
 #if defined(__GNUC__) || defined(__clang__)
 #define ZRQUEUE_LIKELY(x)   __builtin_expect(!!(x), 1)
 #define ZRQUEUE_UNLIKELY(x) __builtin_expect(!!(x), 0)
@@ -313,27 +323,27 @@ namespace zrqueue {
     }
 
     // ============================================================================
-    // [极速无锁队列 SPSCQueue]
+    // [极速无锁队列 SpscQueue]
     // ============================================================================
     template <typename T, typename Allocator = AlignedAllocator<T, ZRQUEUE_CACHE_LINE_SIZE>>
-    class SPSCQueue {
+    class SpscQueue {
     public:
-        explicit SPSCQueue(const uint32_t capacity, const Allocator& allocator = Allocator())
+        explicit SpscQueue(const uint32_t capacity, const Allocator& allocator = Allocator())
             : capacity_(normalize_size(capacity)), allocator_(allocator) {
             mask_ = capacity_ - 1;
             // 分配物理连续内存。因为使用了定制 Allocator，首尾伪共享已经被完美解决，不需要再手工 +Padding
             slots_ = std::allocator_traits<Allocator>::allocate(allocator_, capacity_);
         }
 
-        ~SPSCQueue() {
+        ~SpscQueue() {
             while (front()) {
                 pop();
             }
             std::allocator_traits<Allocator>::deallocate(allocator_, slots_, capacity_);
         }
 
-        SPSCQueue(const SPSCQueue&) = delete;
-        SPSCQueue& operator=(const SPSCQueue&) = delete;
+        SpscQueue(const SpscQueue&) = delete;
+        SpscQueue& operator=(const SpscQueue&) = delete;
 
         template <typename... Args>
         void emplace(Args&&...args) noexcept(std::is_nothrow_constructible<T, Args&&...>::value) {
@@ -353,7 +363,7 @@ namespace zrqueue {
         }
 
         template <typename... Args>
-        bool try_emplace(Args&&...args) noexcept(std::is_nothrow_constructible<T, Args&&...>::value) {
+        ZRQUEUE_NODISCARD bool try_emplace(Args&&...args) noexcept(std::is_nothrow_constructible<T, Args&&...>::value) {
             static_assert(std::is_constructible<T, Args&&...>::value, "T must be constructible with Args&&...");
 
             auto const write_index = write_index_.load(std::memory_order_relaxed);
@@ -380,13 +390,27 @@ namespace zrqueue {
             emplace(std::forward<P>(v));
         }
 
-        bool try_push(const T& v) noexcept(std::is_nothrow_copy_constructible<T>::value) {
+        ZRQUEUE_NODISCARD bool try_push(const T& v) noexcept(std::is_nothrow_copy_constructible<T>::value) {
             return try_emplace(v);
         }
 
         template <typename P, typename = typename std::enable_if<std::is_constructible<T, P&&>::value>::type>
-        bool try_push(P&& v) noexcept(std::is_nothrow_constructible<T, P&&>::value) {
+        ZRQUEUE_NODISCARD bool try_push(P&& v) noexcept(std::is_nothrow_constructible<T, P&&>::value) {
             return try_emplace(std::forward<P>(v));
+        }
+
+        // 获取数据指针，用于 In-place 原地处理，实现绝对零拷贝
+        ZRQUEUE_NODISCARD T* front() noexcept {
+            auto const read_index = read_index_.load(std::memory_order_relaxed);
+            if (ZRQUEUE_LIKELY(read_index < cached_write_index_)) {
+                return &slots_[read_index & mask_];
+            }
+            cached_write_index_ = write_index_.load(std::memory_order_acquire);
+            if (ZRQUEUE_LIKELY(read_index < cached_write_index_)) {
+                return &slots_[read_index & mask_];
+            }
+
+            return nullptr;
         }
 
         // ------------------------------------------------------------------------
@@ -394,61 +418,49 @@ namespace zrqueue {
         // 适用场景：策略核心主循环，死等行情数据。
         // 核心优势：在 100% 空转死循环中加入 _mm_pause，保护 CPU 不掉频。
         // ------------------------------------------------------------------------
-        T* spin_front() noexcept {
+        ZRQUEUE_NODISCARD T* spin_front() noexcept {
+            auto const read_index = read_index_.load(std::memory_order_relaxed);
+            if (ZRQUEUE_LIKELY(read_index < cached_write_index_)) {
+                return &slots_[read_index & mask_];
+            }
+
+            // 第二步：没查到，进入跨核拉取死等模式
             while (true) {
-                // 1. 先用最低开销检查本地缓存
-                auto const read_index = read_index_.load(std::memory_order_relaxed);
-                if (ZRQUEUE_LIKELY(read_index != cached_write_index_)) {
-                    return &slots_[read_index & mask_];
-                }
-
-                // 2. 本地没数据，跨核拉取最新状态
                 cached_write_index_ = write_index_.load(std::memory_order_acquire);
-                if (ZRQUEUE_LIKELY(read_index != cached_write_index_)) {
+                if (ZRQUEUE_LIKELY(read_index < cached_write_index_)) {
                     return &slots_[read_index & mask_];
                 }
 
-                // 3. 真的没数据！执行底层硬件级暂停，防止 CPU 算术逻辑单元(ALU)烧毁降频
                 ZRQUEUE_CPU_PAUSE();
             }
-        }
-
-        // 获取数据指针，用于 In-place 原地处理，实现绝对零拷贝
-        T* front() noexcept {
-            auto const read_index = read_index_.load(std::memory_order_relaxed);
-            if (read_index == cached_write_index_) {
-                cached_write_index_ = write_index_.load(std::memory_order_acquire);
-                if (cached_write_index_ == read_index) {
-                    return nullptr;
-                }
-            }
-            return &slots_[read_index & mask_];
-        }
-
-        // 允许查看当前读取游标往后 offset 位置的元素，但不移动游标
-        T* peek(size_t offset = 0) noexcept {
-            auto const read_index = read_index_.load(std::memory_order_relaxed);
-
-            // 确保加上 offset 后，依然没有越过生产者写入的位置
-            if (read_index + offset >= cached_write_index_) {
-                cached_write_index_ = write_index_.load(std::memory_order_acquire);
-                if (read_index + offset >= cached_write_index_) {
-                    return nullptr; // 没有那么多数据
-                }
-            }
-            return &slots_[(read_index + offset) & mask_];
         }
 
         // 数据处理完后弹出，手工析构生命周期
         void pop() noexcept {
             static_assert(std::is_nothrow_destructible<T>::value, "T must be nothrow destructible");
+
             auto const read_index = read_index_.load(std::memory_order_relaxed);
-
-            assert(write_index_.load(std::memory_order_acquire) != read_index &&
-                "Can only call pop() after front() has returned a non-nullptr");
-
-            slots_[read_index & mask_].~T();
+            if constexpr (!std::is_trivially_destructible_v<T>) {
+                slots_[read_index & mask_].~T();
+            }
             read_index_.store(read_index + 1, std::memory_order_release);
+        }
+
+        // 允许查看当前读取游标往后 offset 位置的元素，但不移动游标
+        ZRQUEUE_NODISCARD T* peek(size_t offset = 0) noexcept {
+            auto const read_index = read_index_.load(std::memory_order_relaxed);
+            auto new_read_index = read_index + offset;
+
+            // 确保加上 offset 后，依然没有越过生产者写入的位置
+            if (ZRQUEUE_LIKELY(new_read_index < cached_write_index_)) {
+                return &slots_[new_read_index & mask_];
+            }
+            cached_write_index_ = write_index_.load(std::memory_order_acquire);
+            if (ZRQUEUE_UNLIKELY(new_read_index < cached_write_index_)) {
+                return &slots_[new_read_index & mask_];
+            }
+
+            return nullptr;
         }
 
         // ------------------------------------------------------------------------
@@ -457,8 +469,8 @@ namespace zrqueue {
         // 核心优势：无论写入多少个元素，只执行【1次】原子的 Release 屏障！
         // ------------------------------------------------------------------------
         template <typename Iterator>
-        size_t push_bulk(Iterator first, size_t count) noexcept {
-            if (count == 0) {
+        ZRQUEUE_NODISCARD size_t push_bulk(Iterator first, size_t count) noexcept {
+            if (ZRQUEUE_UNLIKELY(count == 0)) {
                 return 0;
             }
 
@@ -468,7 +480,7 @@ namespace zrqueue {
             if (ZRQUEUE_UNLIKELY(write_index + count - cached_read_index_ > capacity_)) {
                 cached_read_index_ = read_index_.load(std::memory_order_acquire);
                 // 真实空间依然不够，计算最大可写入数量 (Partial Push)
-                if (write_index + count - cached_read_index_ > capacity_) {
+                if (ZRQUEUE_UNLIKELY(write_index + count - cached_read_index_ > capacity_)) {
                     count = capacity_ - (write_index - cached_read_index_);
                     if (count == 0) {
                         return 0; // 队列全满
@@ -493,13 +505,13 @@ namespace zrqueue {
         // max_count 默认为 0，表示“有多少吃多少”。
         // ------------------------------------------------------------------------
         template <typename TfnHandler>
-        size_t consume_bulk(TfnHandler&& handler, size_t max_count = 0) noexcept {
+        ZRQUEUE_NODISCARD size_t consume_bulk(TfnHandler&& handler, size_t max_count = 0) noexcept {
             auto const read_index = read_index_.load(std::memory_order_relaxed);
 
             // 1. 获取当前共有多少积压数据
-            if (read_index == cached_write_index_) {
+            if (ZRQUEUE_UNLIKELY(read_index == cached_write_index_)) {
                 cached_write_index_ = write_index_.load(std::memory_order_acquire);
-                if (read_index == cached_write_index_) {
+                if (ZRQUEUE_UNLIKELY(read_index == cached_write_index_)) {
                     return 0; // 队列空
                 }
             }
@@ -512,8 +524,11 @@ namespace zrqueue {
                 size_t current_offset = (read_index + i) & mask_;
                 // 将数据的引用直接扔给用户的 lambda 函数处理 (绝无数据复制)
                 std::forward<TfnHandler>(handler)(slots_[current_offset]);
-                // 处理完后手工销毁
-                slots_[current_offset].~T();
+
+                if constexpr (!std::is_trivially_destructible_v<T>) {
+                    // 处理完后手工销毁
+                    slots_[current_offset].~T();
+                }
             }
 
             // 3. 批量处理完毕，仅需 1 次原子释放！
@@ -521,17 +536,17 @@ namespace zrqueue {
             return count_to_consume; // 返回实际处理的个数
         }
 
-        size_t size() const noexcept {
+        ZRQUEUE_NODISCARD size_t size() const noexcept {
             uint64_t w = write_index_.load(std::memory_order_acquire);
             uint64_t r = read_index_.load(std::memory_order_acquire);
             return (w >= r) ? static_cast<size_t>(w - r) : 0;
         }
 
-        bool empty() const noexcept {
+        ZRQUEUE_NODISCARD bool empty() const noexcept {
             return write_index_.load(std::memory_order_acquire) == read_index_.load(std::memory_order_acquire);
         }
 
-        size_t capacity() const noexcept { 
+        ZRQUEUE_NODISCARD size_t capacity() const noexcept {
             return capacity_; 
         }
 
@@ -551,39 +566,35 @@ namespace zrqueue {
         // 【缓存行】：冷数据区。盘中绝对不变的元数据，远离热点指针区
         alignas(ZRQUEUE_CACHE_LINE_SIZE) uint32_t capacity_ { 0 };
         uint32_t mask_{ 0 };
-        T* slots_{ nullptr };
+        T *slots_{ nullptr };
 
         // 【缓存行】：分配器占据独立空间
         alignas(ZRQUEUE_CACHE_LINE_SIZE) Allocator allocator_ {};
-    };
+    };  // end SpscQueue
 
     /**
-     * @brief 极致内嵌的 SPSC 队列 (Static / In-place)
-     *
+     * @brief 极致内嵌的 SPSC 队列 (In-place)
      * 警告：由于数据内嵌在对象内部，如果 N 非常大，对象体积将极其庞大。
      * 绝对不要将其分配在线程栈（Stack）上！必须声明为全局变量(static) 或通过 new 分配在堆上。
-     *
      * @tparam T 元素类型
      * @tparam N 队列容量 (【必须】是 2 的次幂)
      */
     template <typename T, uint32_t N>
-    class SPSCStaticQueue {
+    class SpscInlineQueue {
         // 【编译期防御】：强行要求 N 是 2 的次幂，从根源消灭运行期位运算的风险
         static_assert(N >= 2, "Capacity must be at least 2");
         static_assert((N & (N - 1)) == 0, "Capacity N must be a power of 2 for bitwise masking");
-
     public:
-        SPSCStaticQueue() noexcept = default;
-
-        ~SPSCStaticQueue() {
+        SpscInlineQueue() noexcept = default;
+        ~SpscInlineQueue() {
             while (front()) {
                 pop();
             }
         }
 
         // non-copyable and non-movable
-        SPSCStaticQueue(const SPSCStaticQueue&) = delete;
-        SPSCStaticQueue& operator=(const SPSCStaticQueue&) = delete;
+        SpscInlineQueue(const SpscInlineQueue&) = delete;
+        SpscInlineQueue& operator=(const SpscInlineQueue&) = delete;
 
         template <typename... Args>
         void emplace(Args&&... args) noexcept(std::is_nothrow_constructible<T, Args&&...>::value) {
@@ -605,8 +616,8 @@ namespace zrqueue {
         template <typename... Args>
         bool try_emplace(Args&&... args) noexcept(std::is_nothrow_constructible<T, Args&&...>::value) {
             auto const write_index = write_index_.load(std::memory_order_relaxed);
-            auto next_write_index = write_index + 1;
-
+            auto next_write_index  = write_index + 1;
+            
             if (ZRQUEUE_UNLIKELY(next_write_index - cached_read_index_ > N)) {
                 cached_read_index_ = read_index_.load(std::memory_order_acquire);
                 if (ZRQUEUE_UNLIKELY(next_write_index - cached_read_index_ > N)) {
@@ -623,20 +634,20 @@ namespace zrqueue {
             emplace(v);
         }
 
-        bool try_push(const T& v) noexcept(std::is_nothrow_copy_constructible<T>::value) {
+        ZRQUEUE_NODISCARD bool try_push(const T& v) noexcept(std::is_nothrow_copy_constructible<T>::value) {
             return try_emplace(v);
         }
 
         template <typename Iterator>
-        size_t push_bulk(Iterator first, size_t count) noexcept {
-            if (count == 0) {
+        ZRQUEUE_NODISCARD size_t push_bulk(Iterator first, size_t count) noexcept {
+            if (ZRQUEUE_UNLIKELY(count == 0)) {
                 return 0;
             }
 
             auto const write_index = write_index_.load(std::memory_order_relaxed);
             if (ZRQUEUE_UNLIKELY(write_index + count - cached_read_index_ > N)) {
                 cached_read_index_ = read_index_.load(std::memory_order_acquire);
-                if (write_index + count - cached_read_index_ > N) {
+                if (ZRQUEUE_UNLIKELY(write_index + count - cached_read_index_ > N)) {
                     count = N - (write_index - cached_read_index_);
                     if (count == 0) {
                         return 0;
@@ -653,38 +664,29 @@ namespace zrqueue {
             return count;
         }
 
-        T* front() noexcept {
+        ZRQUEUE_NODISCARD T* front() noexcept {
             auto const read_index = read_index_.load(std::memory_order_relaxed);
-            if (read_index == cached_write_index_) {
-                cached_write_index_ = write_index_.load(std::memory_order_acquire);
-                if (cached_write_index_ == read_index) {
-                    return nullptr;
-                }
+            if (ZRQUEUE_LIKELY(read_index < cached_write_index_)) {
+                return &reinterpret_cast<T*>(slots_memory_)[read_index & MASK];
             }
-            return &reinterpret_cast<T*>(slots_memory_)[read_index & MASK];
+            cached_write_index_ = write_index_.load(std::memory_order_acquire);
+            if (ZRQUEUE_LIKELY(read_index < cached_write_index_)) {
+                return &reinterpret_cast<T*>(slots_memory_)[read_index & MASK];
+            }
+
+            return nullptr;
         }
 
-        T* peek(size_t offset = 0) noexcept {
+        ZRQUEUE_NODISCARD T* spin_front() noexcept {
+
             auto const read_index = read_index_.load(std::memory_order_relaxed);
-
-            if (read_index + offset >= cached_write_index_) {
-                cached_write_index_ = write_index_.load(std::memory_order_acquire);
-                if (read_index + offset >= cached_write_index_) {
-                    return nullptr;
-                }
+            if (ZRQUEUE_LIKELY(read_index < cached_write_index_)) {
+                return &reinterpret_cast<T*>(slots_memory_)[read_index & MASK];
             }
-            return &reinterpret_cast<T*>(slots_memory_)[(read_index + offset) & MASK];
-        }
 
-        T* spin_front() noexcept {
             while (true) {
-                auto const read_index = read_index_.load(std::memory_order_relaxed);
-                if (ZRQUEUE_LIKELY(read_index != cached_write_index_)) {
-                    return &reinterpret_cast<T*>(slots_memory_)[read_index & MASK];
-                }
-
                 cached_write_index_ = write_index_.load(std::memory_order_acquire);
-                if (ZRQUEUE_LIKELY(read_index != cached_write_index_)) {
+                if (ZRQUEUE_LIKELY(read_index < cached_write_index_)) {
                     return &reinterpret_cast<T*>(slots_memory_)[read_index & MASK];
                 }
 
@@ -694,22 +696,35 @@ namespace zrqueue {
 
         void pop() noexcept {
             static_assert(std::is_nothrow_destructible<T>::value, "T must be nothrow destructible");
+
             auto const read_index = read_index_.load(std::memory_order_relaxed);
-
-            assert(write_index_.load(std::memory_order_acquire) != read_index &&
-                "Can only call pop() after front() has returned a non-nullptr");
-
-            reinterpret_cast<T*>(slots_memory_)[read_index & MASK].~T();
+            if constexpr (!std::is_trivially_destructible_v<T>) {
+                reinterpret_cast<T*>(slots_memory_)[read_index & MASK].~T();
+            }
             read_index_.store(read_index + 1, std::memory_order_release);
         }
 
+        ZRQUEUE_NODISCARD T* peek(size_t offset = 0) noexcept {
+            auto const read_index = read_index_.load(std::memory_order_relaxed);
+            auto new_read_index = read_index + offset;
+            if (ZRQUEUE_LIKELY(new_read_index < cached_write_index_)) {
+                return &reinterpret_cast<T*>(slots_memory_)[new_read_index & MASK];
+            }
+            cached_write_index_ = write_index_.load(std::memory_order_acquire);
+            if (ZRQUEUE_UNLIKELY(new_read_index < cached_write_index_)) {
+                return &reinterpret_cast<T*>(slots_memory_)[new_read_index & MASK];
+            }
+
+            return nullptr;
+        }
+
         template <typename TfnHandler>
-        size_t consume_bulk(TfnHandler&& handler, size_t max_count = 0) noexcept {
+        ZRQUEUE_NODISCARD size_t consume_bulk(TfnHandler&& handler, size_t max_count = 0) noexcept {
             auto const read_index = read_index_.load(std::memory_order_relaxed);
 
-            if (read_index == cached_write_index_) {
+            if (ZRQUEUE_UNLIKELY(read_index == cached_write_index_)) {
                 cached_write_index_ = write_index_.load(std::memory_order_acquire);
-                if (read_index == cached_write_index_) {
+                if (ZRQUEUE_UNLIKELY(read_index == cached_write_index_)) {
                     return 0;
                 }
             }
@@ -721,43 +736,190 @@ namespace zrqueue {
             for (size_t i = 0; i < count_to_consume; ++i) {
                 size_t current_offset = (read_index + i) & MASK;
                 std::forward<TfnHandler>(handler)(raw_array[current_offset]);
-                raw_array[current_offset].~T(); // 原地析构
+
+                if constexpr (!std::is_trivially_destructible_v<T>) {
+                    raw_array[current_offset].~T(); // 原地析构
+                }
             }
 
             read_index_.store(read_index + count_to_consume, std::memory_order_release);
             return count_to_consume;
         }
 
-        size_t size() const noexcept {
+        ZRQUEUE_NODISCARD size_t size() const noexcept {
             uint64_t w = write_index_.load(std::memory_order_acquire);
             uint64_t r = read_index_.load(std::memory_order_acquire);
             return (w >= r) ? static_cast<size_t>(w - r) : 0;
         }
 
-        bool empty() const noexcept {
+        ZRQUEUE_NODISCARD bool empty() const noexcept {
             return write_index_.load(std::memory_order_acquire) == read_index_.load(std::memory_order_acquire);
         }
 
-        constexpr size_t capacity() const noexcept { 
+        ZRQUEUE_NODISCARD constexpr size_t capacity() const noexcept {
             return N; 
         }
 
     private:
         static constexpr uint32_t MASK = N - 1;
 
-        // 【缓存行】：生产者专区。
+        // 【缓存行】：生产者专区
         alignas(ZRQUEUE_CACHE_LINE_SIZE) std::atomic<uint64_t> write_index_{ 0 };
         alignas(ZRQUEUE_CACHE_LINE_SIZE) uint64_t cached_read_index_ { 0 };
 
-        // 【缓存行】：消费者专区。
+        // 【缓存行】：消费者专区
         alignas(ZRQUEUE_CACHE_LINE_SIZE) std::atomic<uint64_t> read_index_{ 0 };
         alignas(ZRQUEUE_CACHE_LINE_SIZE) uint64_t cached_write_index_ { 0 };
 
         // 【缓存行】：纯内嵌数据区 (In-place Memory Array)
         // 1. alignas(ZRQUEUE_CACHE_LINE_SIZE) 强制数据区的首地址与上方的索引区彻底物理切断。
         // 2. alignas(T) 确保强制类型转换 reinterpret_cast<T*> 是对齐安全的。
-        // 3. unsigned char 确保这是一块不调用任何构造函数的“纯粹垃圾内存”，仅在 push 时现场构造。
-        alignas(ZRQUEUE_CACHE_LINE_SIZE) alignas(T) unsigned char slots_memory_[N * sizeof(T)];
-    };
+        // 3. std::byte 确保这是一块不调用任何构造函数的“纯粹垃圾内存”，仅在 push 时现场构造。
+        alignas(ZRQUEUE_CACHE_LINE_SIZE) alignas(T) std::byte slots_memory_[N * sizeof(T)];
+    }; // end SpscInlineQueue
 
-}  // namespace zrqueue
+    //编译期定长，预先构造对象，零拷贝读写，适合 Disruptor 模式
+    template<class T, uint32_t N>
+    class SpscRingBuffer {
+        static_assert(N >= 2, "Capacity must be at least 2");
+        static_assert((N & (N - 1)) == 0, "N must be a power of 2");
+
+        //static_assert(std::is_trivially_destructible<T>::value, 
+        //    "SpscRingBuffer is designed for POD types to prevent delayed resource deallocation.");
+
+    public:
+        SpscRingBuffer() noexcept = default;
+        ~SpscRingBuffer() noexcept = default;
+
+        // non-copyable and non-movable
+        SpscRingBuffer(const SpscRingBuffer&) = delete;
+        SpscRingBuffer& operator=(const SpscRingBuffer&) = delete;
+
+        ZRQUEUE_NODISCARD T* alloc() {
+            auto const write_index = write_index_.load(std::memory_order_relaxed);
+            auto next_write_index  = write_index + 1;
+
+            if (ZRQUEUE_LIKELY(next_write_index - cached_read_index_ <= N)) {
+                return &data_[write_index & MASK];
+            }
+            cached_read_index_ = read_index_.load(std::memory_order_acquire);
+            if (ZRQUEUE_LIKELY(next_write_index - cached_read_index_ <= N)) {
+                return &data_[write_index & MASK];
+            }
+
+            return nullptr;
+        }
+
+        void push() {
+            auto const write_index = write_index_.load(std::memory_order_relaxed);
+            write_index_.store(write_index + 1, memory_order_release);
+        }
+
+        template<typename Writer>
+        ZRQUEUE_NODISCARD bool try_push(Writer writer) {
+            T *p = alloc();
+            if (!p) {
+                return false;
+            }
+
+            writer(p);
+            push();
+            return true;
+        }
+
+        template<typename Writer>
+        void push(Writer writer) {
+            while (!try_push(writer)) {
+            }
+        }
+
+        ZRQUEUE_NODISCARD T* front() {
+            auto const read_index = read_index_.load(std::memory_order_relaxed);
+            if (ZRQUEUE_LIKELY(read_index < cached_write_index_)) {
+                return &data_[read_index & MASK];
+            }
+            cached_write_index_ = write_index_.load(std::memory_order_acquire);
+            if (ZRQUEUE_LIKELY(read_index < cached_write_index_)) {
+                return &data_[read_index & MASK];
+            }
+
+            return nullptr;
+        }
+
+        ZRQUEUE_NODISCARD T* spin_front() noexcept {
+            auto const read_index = read_index_.load(std::memory_order_relaxed);
+            if (ZRQUEUE_LIKELY(read_index < cached_write_index_)) {
+                return &data_[read_index & MASK];
+            }
+
+            while (true) {
+                cached_write_index_ = write_index_.load(std::memory_order_acquire);
+                if (ZRQUEUE_LIKELY(read_index < cached_write_index_)) {
+                    return &data_[read_index & MASK];
+                }
+
+                ZRQUEUE_CPU_PAUSE();
+            }
+        }
+
+        void pop() {
+            auto const read_index = read_index_.load(std::memory_order_relaxed);
+            read_index_.store(read_index + 1, std::memory_order_release);
+        }
+
+        ZRQUEUE_NODISCARD T* peek(size_t offset = 0) noexcept {
+            auto const read_index = read_index_.load(std::memory_order_relaxed);
+            auto new_read_index = read_index + offset;
+            if (ZRQUEUE_LIKELY(new_read_index < cached_write_index_)) {
+                return &data_[new_read_index & MASK];
+            }
+            cached_write_index_ = write_index_.load(std::memory_order_acquire);
+            if (ZRQUEUE_UNLIKELY(new_read_index < cached_write_index_)) {
+                return &data_[new_read_index & MASK];
+            }
+
+            return nullptr;
+        }
+
+        template<typename Reader>
+        ZRQUEUE_NODISCARD bool try_pop(Reader reader) {
+            T *v = front();
+            if (!v) {
+                return false;
+            }
+            reader(v);
+            pop();
+            return true;
+        }
+
+        ZRQUEUE_NODISCARD size_t size() const noexcept {
+            uint64_t w = write_index_.load(std::memory_order_acquire);
+            uint64_t r = read_index_.load(std::memory_order_acquire);
+            return (w >= r) ? static_cast<size_t>(w - r) : 0;
+        }
+
+        ZRQUEUE_NODISCARD bool empty() const noexcept {
+            return write_index_.load(std::memory_order_acquire) == read_index_.load(std::memory_order_acquire);
+        }
+
+        ZRQUEUE_NODISCARD constexpr size_t capacity() const noexcept {
+            return N;
+        }
+
+    private:
+        static constexpr uint32_t MASK = N - 1;
+
+        // 【缓存行】：生产者专区
+        alignas(ZRQUEUE_CACHE_LINE_SIZE) std::atomic<uint64_t> write_index_{ 0 };
+        alignas(ZRQUEUE_CACHE_LINE_SIZE) uint64_t cached_read_index_ { 0 };
+
+        // 【缓存行】：消费者专区
+        alignas(ZRQUEUE_CACHE_LINE_SIZE) std::atomic<uint64_t> read_index_{ 0 };
+        alignas(ZRQUEUE_CACHE_LINE_SIZE) uint64_t cached_write_index_ { 0 };
+
+        // 数据区
+        alignas(ZRQUEUE_CACHE_LINE_SIZE) std::array<T, N> data_ {};
+
+    };  // end SpscRingBuffer
+
+}  // end namespace zrqueue
