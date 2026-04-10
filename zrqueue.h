@@ -28,7 +28,7 @@ SOFTWARE.
 
 #pragma once
 
-#define ZRQUEUE_VERSION 10401 // 1.4.1
+#define ZRQUEUE_VERSION 10402 // 1.4.2
 
 #include <atomic>
 #include <array>

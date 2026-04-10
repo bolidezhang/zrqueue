@@ -1,37 +1,41 @@
-﻿# zrqueue
+﻿这里是完整的、纯 Markdown 格式的 `README.md` 内容。你可以直接点击右上角的“复制”按钮，保存为 `README.md` 文件。
+
+```markdown
+# zrqueue
 
 ## Overview
-`zrqueue::SpscQueue` is a wait-free, lock-free, fixed-size single-producer single-consumer queue provided as a **single-header** C++ library. 
-It is proven to be significantly faster and more stable than `rigtorp::SPSCQueue`. 
+`zrqueue` is a wait-free, lock-free, single-producer single-consumer (SPSC) queue library provided as a **single-header** C++17 library. 
+It is proven to be significantly faster and more stable than the industry-standard `rigtorp::SPSCQueue`. 
 
 Designed strictly for High-Frequency Trading (HFT) and ultra-low latency (ULL) systems where every nanosecond counts, 
-`zrqueue` applies hardware-level micro-architectural optimizations including zero-branching, strict cache-line isolation, OS HugePages support, and hardware pausing. 
-Because it is entirely self-contained in one file, it offers the ultimate ease of integration—just drop it in and compile.
+`zrqueue` applies extreme hardware-level micro-architectural optimizations. By offering three distinct memory models (Heap-allocated, In-place embedded, and Pre-constructed Ring Buffer), it covers every possible hot-path scenario. Because it is entirely self-contained in one file, it offers the ultimate ease of integration—just drop it in and compile.
 
 ## Key Features
 
-* **Single-Header & Drop-in Ready:** No building, no linking, no external dependencies. Just `#include "zrqueue.h"` and you are ready to go.
+* **Three Distinct Queue Models:**
+  * `SpscQueue`: Dynamic capacity, heap-allocated, supports OS HugePages.
+  * `SpscInlineQueue`: Zero-allocation, data is embedded directly within the object footprint via `std::byte` arrays, eliminating the final pointer-chasing penalty.
+  * `SpscRingBuffer`: Disruptor-style claim/commit paradigm. Objects are pre-constructed and memory-pre-faulted, enabling absolute zero-copy modifications.
 * **Zero Branch Misprediction:** Uses monotonically increasing `uint64_t` indices and bitwise AND (`& mask_`) instead of modulo or `if`-based wrap-around.
-* **Perfect Cache Line Isolation:** Every heavily-contended atomic variable and cached index strictly occupies its own dedicated 64-byte L1 Cache Line to utterly eradicate Cache Coherence Ping-Pong and False Sharing.
-* **Static In-Place Array (`SpscInlineQueue`):** An alternative zero-allocation queue where data is embedded directly within the object footprint, eliminating the final pointer-chasing (dereference) penalty.
-* **Custom HFT Allocators:** 
-  * `AlignedAllocator`: Rounds up capacity to strictly align with cache lines, preventing tail false-sharing.
-  * `HugePageAllocator`: Cross-platform support for 2MB/1GB OS Huge Pages to eliminate TLB Misses on massive queues.
-* **Micro-burst Defense:** Native `push_bulk` and `consume_bulk` APIs that execute only **one** memory barrier for `N` elements.
-* **Hardware Thermal Throttling Defense:** Built-in `spin_front()` utilizing `_mm_pause()` / `yield` to prevent CPU ALU burnout and thermal downclocking during 100% busy-polling.
+* **Perfect Cache Line Isolation:** Every heavily-contended atomic variable strictly occupies its own dedicated 64-byte L1 Cache Line to utterly eradicate Cache Coherence Ping-Pong and Asymmetric False Sharing.
+* **Memory Pre-Warming & Page-Fault Defense:** Aggressive use of value-initialization (`data_{}`) to trigger OS page faults during the application startup phase, ensuring zero latency spikes during live market hours.
+* **Trivial Destructor Elision:** Leverages C++17 `if constexpr (!std::is_trivially_destructible_v<T>)` to completely bypass destruction overhead for POD types (Zero-Cost Abstraction).
+* **Lookahead Support:** Native `peek(offset)` API allows consumers to inspect future elements without committing a `pop()`.
+* **Micro-burst Defense:** Native `push_bulk` and `consume_bulk` APIs that execute only **one** atomic memory barrier for `N` elements.
+* **Hardware Thermal Throttling Defense:** Built-in `spin_front()` extracts invariant loads out of the loop and utilizes `_mm_pause()` / `yield` to prevent CPU ALU burnout and thermal downclocking during 100% busy-polling.
 
 ## Architectural Superiority
 
-When compared to `rigtorp::SPSCQueue` (the industry standard for lock-free queues), `zrqueue` applies "surgical" rewrites specifically aimed at the HFT Hot Path.
+When compared to `rigtorp::SPSCQueue`, `zrqueue` applies "surgical" rewrites specifically aimed at the HFT Hot Path.
 
-| Feature | `rigtorp::SPSCQueue` | `zrqueue::SpscQueue` | HFT Advantage |
+| Feature | `rigtorp::SPSCQueue` | `zrqueue::SpscQueue` / Models | HFT Advantage |
 | :--- | :--- | :--- | :--- |
-| **Indexing Model** | `0` to `N-1` Wrap-around | Infinite Monotonic (`uint64_t`) | Math simplicity, no boundary edge cases. |
 | **Addressing (Hot Path)** | `if (next == cap) next = 0;` | Bitwise `& mask_` | **Zero Branching.** Saves ~10ns periodic branch misprediction penalty (Jitter). |
-| **Queue Capacity** | Any size (wastes 1 slack slot) | Strictly Power of 2 | 100% memory utilization, enables bitwise masking. |
-| **False Sharing Defense** | Internal Padding Elements | Strict `AlignedAllocator` / `alignas` | No wasted array slots, perfectly aligns to physical OS pages. |
-| **TLB Miss Defense** | Standard `malloc` (4KB pages) | `HugePageAllocator` (2MB/1GB) | Sustains max throughput on multi-million element queues (e.g., Order Book ticks). |
-| **Pointer Dereference** | Always `slots_[idx]` (Heap) | `SpscInlineQueue` (In-place) | Faster base-offset addressing, zero dynamic allocation. |
+| **Memory Isolation** | Padding Array Elements | Strict `alignas(64)` Structs | Complete physical isolation of Producer/Consumer atomic updates. |
+| **Destruction Overhead** | Always calls `~T()` | C++17 `if constexpr` bypass | Zero CPU cycles wasted on destructing Plain Old Data (POD). |
+| **Memory Page Faults** | Lazy / Demand Paging | Forced Pre-Warming (`data_{}`) | Eliminates ~5μs First-Touch Page Faults at market open. |
+| **TLB Miss Defense** | Standard `malloc` (4KB) | `HugePageAllocator` (2MB/1GB) | Sustains max throughput on multi-million element queues (e.g., Order Books). |
+| **Zero-Copy Write** | Push-by-value/move | `SpscRingBuffer::alloc()` | Disruptor pattern: directly write into the queue's memory slot. |
 
 ## Performance Comparison
 
@@ -48,48 +52,55 @@ Under strict CPU core pinning and `-O3 -march=native` optimizations, `zrqueue` d
 
 ## Usage & Examples
 
-### Dynamic Allocation Queue
-Best for general ultra-low latency message passing.
+### 1. Disruptor-Style Ring Buffer (Absolute Zero-Copy)
+Best for complex structs. You don't create an object and push it; instead, you claim a pre-allocated slot, write to it in-place, and commit.
 ```cpp
 #include "zrqueue.h"
 
 struct Tick { int symbol; double price; };
 
-// Capacity will be automatically rounded up to the nearest power of 2
-zrqueue::SpscQueue<Tick> queue(1024);
+// Capacity must be a power of 2. Pre-allocates and pre-warms memory.
+zrqueue::SpscRingBuffer<Tick, 1024> ring_buffer;
 
-// Producer Thread
-queue.emplace(1001, 3500.50);
-
-// Consumer Thread (Zero-Copy In-Place Processing)
-Tick* tick = queue.front();
+// Producer Thread: Claim, Write, Commit
+Tick* tick = ring_buffer.alloc();
 if (tick) {
-    process(tick->price);
-    queue.pop(); // Manually destruct and release slot
+    tick->symbol = 1001;
+    tick->price = 3500.50;
+    ring_buffer.push(); // Commit (Executes Release Barrier)
 }
+
+// Alternatively, using the lambda API:
+ring_buffer.try_push([](Tick* t) {
+    t->symbol = 1001;
+    t->price = 3500.50;
+});
 ```
 
-### Static Queue (Absolute Zero Allocation)
-Data is embedded directly in the class. Best declared in the `.BSS` segment (global/static) to completely avoid stack overflow and pointer dereferencing.
-
+### 2. Static Inline Queue (Zero Heap Allocation)
+Data is embedded directly in the class footprint via `std::byte` to avoid Strict-Aliasing violations. Best declared in the `.BSS` segment (global/static) to completely avoid stack overflow and pointer dereferencing.
 ```cpp
-// Strictly requires a power-of-2 template argument.
+// 4096 elements embedded in-place
 static zrqueue::SpscInlineQueue<Tick, 4096> g_hot_queue;
 
 void strategy_thread() {
     // spin_front() safely busy-polls while protecting CPU frequencies
     Tick* tick = g_hot_queue.spin_front();
+    
+    // Lookahead (peek at the next element without popping)
+    Tick* next_tick = g_hot_queue.peek(1); 
+
     if (tick) {
         process(tick);
-        g_hot_queue.pop();
+        g_hot_queue.pop(); // Manually destruct (if non-POD) and advance index
     }
 }
 ```
 
-### Bulk Operations (Micro-burst Defense)
-When the network gateway receives 10 UDP packets at once, push them with a single atomic barrier.
-
+### 3. Dynamic Heap Queue with Bulk Operations
+Best for UDP network gateways. When receiving 10 packets via `recvmmsg`, push them with a single atomic barrier.
 ```cpp
+zrqueue::SpscQueue<Tick> queue(1024); // Dynamically rounds up to 1024
 Tick buffer[10] = { ... };
 
 // Pushes up to 10 elements. Executes std::memory_order_release ONLY ONCE!
@@ -101,23 +112,23 @@ queue.consume_bulk([](Tick& tick) {
 }); // Executes std::memory_order_release ONLY ONCE at the end!
 ```
 
-### HugePage Allocator (For Massive Queues)
+### 4. HugePage Allocator (Massive Queues)
 Ideal for preserving historical ticks without thrashing the CPU TLB.
-
 ```cpp
 // Requires OS permissions (e.g., `vm.nr_hugepages` in Linux or "Lock Pages" in Windows)
-zrqueue::SpscQueue<Tick, zrqueue::HugePageAllocator<Tick>> history_queue(10000000);
+zrqueue::SpscQueue<Tick, zrqueue::HugePageAllocator<Tick>> history_queue(1048576);
 ```
 
-### Build Instructions
-As a single-header library, zrqueue requires no complex build systems or external dependencies. Simply drop zrqueue.h into your source tree and include it.
-Requirements:
-C++ Standard: Requires C++17 or later. 
-Compilers: GCC, Clang, or MSVC.
-OS: Linux, macOS, or Windows.
-Architecture: x86_64, aarch64.
-To compile the benchmark tool, use the provided CMakeLists.txt. It is highly recommended to use the modern CMake build command:
-```cpp
+## Build Instructions
+As a single-header library, `zrqueue` requires no complex build systems or external dependencies. Simply drop `zrqueue.h` into your source tree and include it.
+
+* **C++ Standard:** Requires **C++17** or later (uses `if constexpr`, `std::byte`, etc.).
+* **Compilers:** GCC, Clang, or MSVC.
+* **OS:** Linux, macOS, or Windows.
+* **Architecture:** x86_64, aarch64.
+
+To compile the benchmark tool, use the provided `CMakeLists.txt`:
+```bash
 mkdir build && cd build
 cmake .. -DCMAKE_BUILD_TYPE=Release
 cmake --build . --config Release
@@ -125,7 +136,8 @@ cmake --build . --config Release
 # Run benchmark with Thread Affinity (Producer on Core 2, Consumer on Core 4)
 ./benchmark 2 4
 ```
-Note: The CMake configuration automatically applies -O3, -march=native, -flto=auto, and -fomit-frame-pointer for maximum performance.
+*Note: The CMake configuration automatically applies `-O3`, `-march=native`, `-flto`, and `-fomit-frame-pointer` for maximum performance.*
 
-### License
+## License
 MIT License. Copyright (c) 2024 Bolide Zhang.
+```
