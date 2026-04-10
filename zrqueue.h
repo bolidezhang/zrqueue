@@ -812,7 +812,7 @@ namespace zrqueue {
 
         void push() {
             auto const write_index = write_index_.load(std::memory_order_relaxed);
-            write_index_.store(write_index + 1, memory_order_release);
+            write_index_.store(write_index + 1, std::memory_order_release);
         }
 
         template<typename Writer>
