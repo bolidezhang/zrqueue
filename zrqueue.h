@@ -389,8 +389,8 @@ namespace zrqueue {
             emplace(v);
         }
 
-        template <typename P, typename = typename std::enable_if<std::is_constructible<T, P&&>::value>::type>
-        void push(P&& v) noexcept(std::is_nothrow_constructible<T, P&&>::value) {
+        template <typename P, typename = std::enable_if_t<std::is_constructible_v<T, P&&>>>
+        void push(P&& v) noexcept(std::is_nothrow_constructible_v<T, P&&>) {
             emplace(std::forward<P>(v));
         }
 
@@ -398,8 +398,8 @@ namespace zrqueue {
             return try_emplace(v);
         }
 
-        template <typename P, typename = typename std::enable_if<std::is_constructible<T, P&&>::value>::type>
-        ZRQUEUE_NODISCARD bool try_push(P&& v) noexcept(std::is_nothrow_constructible<T, P&&>::value) {
+        template <typename P, typename = std::enable_if_t<std::is_constructible_v<T, P&&>>>
+        ZRQUEUE_NODISCARD bool try_push(P&& v) noexcept(std::is_nothrow_constructible_v<T, P&&>) {
             return try_emplace(std::forward<P>(v));
         }
 
@@ -423,7 +423,7 @@ namespace zrqueue {
         // 核心优势：在 100% 空转死循环中加入 _mm_pause，保护 CPU 不掉频。
         // ------------------------------------------------------------------------
         ZRQUEUE_NODISCARD T* spin_front() noexcept {
-            auto const read_index = read_index_.load(std::memory_order_relaxed);
+            const uint64_t read_index = read_index_.load(std::memory_order_relaxed);
             if (ZRQUEUE_LIKELY(read_index < cached_write_index_)) {
                 return &slots_[read_index & mask_];
             }
@@ -509,7 +509,7 @@ namespace zrqueue {
         // ------------------------------------------------------------------------
         template <typename THandler>
         ZRQUEUE_NODISCARD size_t consume_bulk(THandler&& handler, size_t max_count = 0) noexcept {
-            auto const read_index = read_index_.load(std::memory_order_relaxed);
+            const uint64_t read_index = read_index_.load(std::memory_order_relaxed);
 
             // 1. 获取当前共有多少积压数据
             if (ZRQUEUE_UNLIKELY(read_index == cached_write_index_)) {
@@ -635,8 +635,18 @@ namespace zrqueue {
             emplace(v);
         }
 
+        template <typename P, typename = std::enable_if_t<std::is_constructible_v<T, P&&>>>
+        void push(P&& v) noexcept(std::is_nothrow_constructible_v<T, P&&>) {
+            emplace(std::forward<P>(v));
+        }
+
         ZRQUEUE_NODISCARD bool try_push(const T& v) noexcept(std::is_nothrow_copy_constructible<T>::value) {
             return try_emplace(v);
+        }
+
+        template <typename P, typename = std::enable_if_t<std::is_constructible_v<T, P&&>>>
+        ZRQUEUE_NODISCARD bool try_push(P&& v) noexcept(std::is_nothrow_constructible_v<T, P&&>) {
+            return try_emplace(std::forward<P>(v));
         }
 
         template <typename Iterator>
@@ -806,7 +816,7 @@ namespace zrqueue {
         }
 
         void push() {
-            auto const write_index = write_index_.load(std::memory_order_relaxed);
+            const uint64_t write_index = write_index_.load(std::memory_order_relaxed);
             write_index_.store(write_index + 1, std::memory_order_release);
         }
 
@@ -858,7 +868,7 @@ namespace zrqueue {
         }
 
         void pop() {
-            auto const read_index = read_index_.load(std::memory_order_relaxed);
+            const uint64_t read_index = read_index_.load(std::memory_order_relaxed);
             read_index_.store(read_index + 1, std::memory_order_release);
         }
 
