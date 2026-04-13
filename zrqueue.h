@@ -477,12 +477,13 @@ namespace zrqueue {
                 return 0;
             }
             const uint64_t write_index = write_index_.load(std::memory_order_relaxed);
+            uint64_t new_write_index = write_index + count;
 
             // 1. 检查是否有足够空间容纳 count 个元素
-            if (ZRQUEUE_UNLIKELY(write_index + count - cached_read_index_ > capacity_)) {
+            if (ZRQUEUE_UNLIKELY(new_write_index - cached_read_index_ > capacity_)) {
                 cached_read_index_ = read_index_.load(std::memory_order_acquire);
                 // 真实空间依然不够，计算最大可写入数量 (Partial Push)
-                if (write_index + count - cached_read_index_ > capacity_) {
+                if (new_write_index - cached_read_index_ > capacity_) {
                     count = capacity_ - (write_index - cached_read_index_);
                     if (count == 0) {
                         return 0; // 队列全满
@@ -644,10 +645,11 @@ namespace zrqueue {
                 return 0;
             }
 
-            auto const write_index = write_index_.load(std::memory_order_relaxed);
-            if (ZRQUEUE_UNLIKELY(write_index + count - cached_read_index_ > N)) {
+            const uint64_t write_index = write_index_.load(std::memory_order_relaxed);
+            uint64_t new_write_index = write_index + count;
+            if (ZRQUEUE_UNLIKELY(new_write_index - cached_read_index_ > N)) {
                 cached_read_index_ = read_index_.load(std::memory_order_acquire);
-                if (write_index + count - cached_read_index_ > N) {
+                if (new_write_index - cached_read_index_ > N) {
                     count = N - (write_index - cached_read_index_);
                     if (count == 0) {
                         return 0;
@@ -716,8 +718,8 @@ namespace zrqueue {
             return nullptr;
         }
 
-        template <typename TfnHandler>
-        ZRQUEUE_NODISCARD size_t consume_bulk(TfnHandler&& handler, size_t max_count = 0) noexcept {
+        template <typename THandler>
+        ZRQUEUE_NODISCARD size_t consume_bulk(THandler&& handler, size_t max_count = 0) noexcept {
             const uint64_t read_index = read_index_.load(std::memory_order_relaxed);
             if (ZRQUEUE_UNLIKELY(read_index == cached_write_index_)) {
                 cached_write_index_ = write_index_.load(std::memory_order_acquire);
@@ -732,7 +734,7 @@ namespace zrqueue {
             T *raw_array = reinterpret_cast<T*>(slots_memory_);
             for (size_t i = 0; i < count_to_consume; ++i) {
                 size_t current_offset = (read_index + i) & MASK;
-                std::forward<TfnHandler>(handler)(raw_array[current_offset]);
+                std::forward<THandler>(handler)(raw_array[current_offset]);
 
                 if constexpr (!std::is_trivially_destructible_v<T>) {
                     raw_array[current_offset].~T(); // 原地析构
@@ -761,11 +763,11 @@ namespace zrqueue {
         static constexpr uint32_t MASK = N - 1;
 
         // 【缓存行】：生产者专区
-        alignas(ZRQUEUE_CACHE_LINE_SIZE) std::atomic<uint64_t> write_index_{ 0 };
+        alignas(ZRQUEUE_CACHE_LINE_SIZE) std::atomic<uint64_t> write_index_ { 0 };
         alignas(ZRQUEUE_CACHE_LINE_SIZE) uint64_t cached_read_index_ { 0 };
 
         // 【缓存行】：消费者专区
-        alignas(ZRQUEUE_CACHE_LINE_SIZE) std::atomic<uint64_t> read_index_{ 0 };
+        alignas(ZRQUEUE_CACHE_LINE_SIZE) std::atomic<uint64_t> read_index_ { 0 };
         alignas(ZRQUEUE_CACHE_LINE_SIZE) uint64_t cached_write_index_ { 0 };
 
         // 【缓存行】：纯内嵌数据区 (In-place Memory Array)
