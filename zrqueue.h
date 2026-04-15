@@ -28,7 +28,7 @@ SOFTWARE.
 
 #pragma once
 
-#define ZRQUEUE_VERSION 10402 // 1.4.3
+#define ZRQUEUE_VERSION 10404 // 1.4.4
 
 #include <atomic>
 #include <array>
@@ -59,19 +59,19 @@ SOFTWARE.
 #endif
 
 #ifdef __has_cpp_attribute
-#if __has_cpp_attribute(nodiscard)
-#define ZRQUEUE_NODISCARD [[nodiscard]]
+    #if __has_cpp_attribute(nodiscard)
+        #define ZRQUEUE_NODISCARD [[nodiscard]]
+    #endif
 #endif
-#endif
-#ifndef ZRQUEUE_NODISCARD
-#define ZRQUEUE_NODISCARD
+    #ifndef ZRQUEUE_NODISCARD
+    #define ZRQUEUE_NODISCARD
 #endif
 
 #ifndef MAP_HUGETLB
-#define MAP_HUGETLB 0x40000 
+    #define MAP_HUGETLB 0x40000 
 #endif
 #ifndef MAP_ANONYMOUS
-#define MAP_ANONYMOUS 0x20
+    #define MAP_ANONYMOUS 0x20
 #endif
 
 // ============================================================================
@@ -79,18 +79,29 @@ SOFTWARE.
 // ============================================================================
 // 获取 CPU L1 缓存行大小 (防伪共享核心参数)
 #ifdef __cpp_lib_hardware_interference_size
-inline constexpr size_t ZRQUEUE_CACHE_LINE_SIZE = std::hardware_destructive_interference_size;
+    inline constexpr size_t ZRQUEUE_CACHE_LINE_SIZE = std::hardware_destructive_interference_size;
 #else
-inline constexpr size_t ZRQUEUE_CACHE_LINE_SIZE = 64;
+    inline constexpr size_t ZRQUEUE_CACHE_LINE_SIZE = 64;
 #endif
 
-// 静态分支预测 (将极小概率事件踢出 CPU 指令预取流水线)
+// ============================================================================
+// [编译器宏与微架构级属性标记]
+// ============================================================================
 #if defined(__GNUC__) || defined(__clang__)
-#define ZRQUEUE_LIKELY(x)   __builtin_expect(!!(x), 1)
-#define ZRQUEUE_UNLIKELY(x) __builtin_expect(!!(x), 0)
+    // GCC 与 Clang (包含 Windows 下的 Clang-CL)
+    #define ZRQUEUE_LIKELY(x)    __builtin_expect(!!(x), 1)
+    #define ZRQUEUE_UNLIKELY(x)  __builtin_expect(!!(x), 0)
+    #define ZRQUEUE_FORCE_INLINE inline __attribute__((always_inline))
 #else
-#define ZRQUEUE_LIKELY(x)   (x)
-#define ZRQUEUE_UNLIKELY(x) (x)
+    #define ZRQUEUE_LIKELY(x)    (x)
+    #define ZRQUEUE_UNLIKELY(x)  (x)
+    #if defined(_MSC_VER)
+        // 纯血原生 MSVC 编译器
+        #define ZRQUEUE_FORCE_INLINE __forceinline
+    #else
+        // 未知编译器兜底 fallback
+        #define ZRQUEUE_FORCE_INLINE inline
+    #endif
 #endif
 
 // ============================================================================
@@ -346,7 +357,7 @@ namespace zrqueue {
         SpscQueue& operator=(const SpscQueue&) = delete;
 
         template <typename... Args>
-        void emplace(Args&&...args) noexcept(std::is_nothrow_constructible<T, Args&&...>::value) {
+        ZRQUEUE_FORCE_INLINE void emplace(Args&&...args) noexcept(std::is_nothrow_constructible<T, Args&&...>::value) {
             static_assert(std::is_constructible<T, Args&&...>::value, "T must be constructible with Args&&...");
 
             const uint64_t write_index = write_index_.load(std::memory_order_relaxed);
@@ -363,7 +374,7 @@ namespace zrqueue {
         }
 
         template <typename... Args>
-        ZRQUEUE_NODISCARD bool try_emplace(Args&&...args) noexcept(std::is_nothrow_constructible<T, Args&&...>::value) {
+        ZRQUEUE_NODISCARD ZRQUEUE_FORCE_INLINE bool try_emplace(Args&&...args) noexcept(std::is_nothrow_constructible<T, Args&&...>::value) {
             static_assert(std::is_constructible<T, Args&&...>::value, "T must be constructible with Args&&...");
             const uint64_t write_index = write_index_.load(std::memory_order_relaxed);
 
@@ -385,26 +396,26 @@ namespace zrqueue {
             return false;
         }
 
-        void push(const T& v) noexcept(std::is_nothrow_copy_constructible<T>::value) {
+        ZRQUEUE_FORCE_INLINE void push(const T& v) noexcept(std::is_nothrow_copy_constructible<T>::value) {
             emplace(v);
         }
 
         template <typename P, typename = std::enable_if_t<std::is_constructible_v<T, P&&>>>
-        void push(P&& v) noexcept(std::is_nothrow_constructible_v<T, P&&>) {
+        ZRQUEUE_FORCE_INLINE void push(P&& v) noexcept(std::is_nothrow_constructible_v<T, P&&>) {
             emplace(std::forward<P>(v));
         }
 
-        ZRQUEUE_NODISCARD bool try_push(const T& v) noexcept(std::is_nothrow_copy_constructible<T>::value) {
+        ZRQUEUE_NODISCARD ZRQUEUE_FORCE_INLINE bool try_push(const T& v) noexcept(std::is_nothrow_copy_constructible<T>::value) {
             return try_emplace(v);
         }
 
         template <typename P, typename = std::enable_if_t<std::is_constructible_v<T, P&&>>>
-        ZRQUEUE_NODISCARD bool try_push(P&& v) noexcept(std::is_nothrow_constructible_v<T, P&&>) {
+        ZRQUEUE_NODISCARD ZRQUEUE_FORCE_INLINE bool try_push(P&& v) noexcept(std::is_nothrow_constructible_v<T, P&&>) {
             return try_emplace(std::forward<P>(v));
         }
 
         // 获取数据指针，用于 In-place 原地处理，实现绝对零拷贝
-        ZRQUEUE_NODISCARD T* front() noexcept {
+        ZRQUEUE_NODISCARD ZRQUEUE_FORCE_INLINE T* front() noexcept {
             const uint64_t read_index = read_index_.load(std::memory_order_relaxed);
             if (ZRQUEUE_LIKELY(read_index < cached_write_index_)) {
                 return &slots_[read_index & mask_];
@@ -440,7 +451,7 @@ namespace zrqueue {
         }
 
         // 数据处理完后弹出，手工析构生命周期
-        void pop() noexcept {
+        ZRQUEUE_FORCE_INLINE void pop() noexcept {
             static_assert(std::is_nothrow_destructible<T>::value, "T must be nothrow destructible");
             const uint64_t read_index = read_index_.load(std::memory_order_relaxed);
             if constexpr (!std::is_trivially_destructible_v<T>) {
@@ -450,7 +461,7 @@ namespace zrqueue {
         }
 
         // 允许查看当前读取游标往后 offset 位置的元素，但不移动游标
-        ZRQUEUE_NODISCARD T* peek(size_t offset = 0) noexcept {
+        ZRQUEUE_NODISCARD ZRQUEUE_FORCE_INLINE T* peek(size_t offset = 0) noexcept {
             const uint64_t read_index = read_index_.load(std::memory_order_relaxed);
             uint64_t new_read_index = read_index + offset;
 
@@ -539,17 +550,17 @@ namespace zrqueue {
             return count_to_consume; // 返回实际处理的个数
         }
 
-        ZRQUEUE_NODISCARD size_t size() const noexcept {
+        ZRQUEUE_NODISCARD ZRQUEUE_FORCE_INLINE size_t size() const noexcept {
             uint64_t w = write_index_.load(std::memory_order_acquire);
             uint64_t r = read_index_.load(std::memory_order_acquire);
             return (w >= r) ? static_cast<size_t>(w - r) : 0;
         }
 
-        ZRQUEUE_NODISCARD bool empty() const noexcept {
+        ZRQUEUE_NODISCARD ZRQUEUE_FORCE_INLINE bool empty() const noexcept {
             return write_index_.load(std::memory_order_acquire) == read_index_.load(std::memory_order_acquire);
         }
 
-        ZRQUEUE_NODISCARD size_t capacity() const noexcept {
+        ZRQUEUE_NODISCARD ZRQUEUE_FORCE_INLINE size_t capacity() const noexcept {
             return capacity_; 
         }
 
@@ -600,7 +611,7 @@ namespace zrqueue {
         SpscInlineQueue& operator=(const SpscInlineQueue&) = delete;
 
         template <typename... Args>
-        void emplace(Args&&... args) noexcept(std::is_nothrow_constructible<T, Args&&...>::value) {
+        ZRQUEUE_FORCE_INLINE void emplace(Args&&... args) noexcept(std::is_nothrow_constructible<T, Args&&...>::value) {
             static_assert(std::is_constructible<T, Args&&...>::value, "T must be constructible with Args&&...");
             const uint64_t write_index = write_index_.load(std::memory_order_relaxed);
             uint64_t next_write_index  = write_index + 1;
@@ -614,7 +625,7 @@ namespace zrqueue {
         }
 
         template <typename... Args>
-        bool try_emplace(Args&&... args) noexcept(std::is_nothrow_constructible<T, Args&&...>::value) {
+        ZRQUEUE_FORCE_INLINE bool try_emplace(Args&&... args) noexcept(std::is_nothrow_constructible<T, Args&&...>::value) {
             const uint64_t write_index = write_index_.load(std::memory_order_relaxed);
             if (ZRQUEUE_LIKELY(write_index - cached_read_index_ < N)) {
                 new (&reinterpret_cast<T*>(slots_memory_)[write_index & MASK]) T(std::forward<Args>(args)...);
@@ -631,21 +642,21 @@ namespace zrqueue {
             return false;
         }
 
-        void push(const T& v) noexcept(std::is_nothrow_copy_constructible<T>::value) {
+        ZRQUEUE_FORCE_INLINE void push(const T& v) noexcept(std::is_nothrow_copy_constructible<T>::value) {
             emplace(v);
         }
 
         template <typename P, typename = std::enable_if_t<std::is_constructible_v<T, P&&>>>
-        void push(P&& v) noexcept(std::is_nothrow_constructible_v<T, P&&>) {
+        ZRQUEUE_FORCE_INLINE void push(P&& v) noexcept(std::is_nothrow_constructible_v<T, P&&>) {
             emplace(std::forward<P>(v));
         }
 
-        ZRQUEUE_NODISCARD bool try_push(const T& v) noexcept(std::is_nothrow_copy_constructible<T>::value) {
+        ZRQUEUE_NODISCARD ZRQUEUE_FORCE_INLINE bool try_push(const T& v) noexcept(std::is_nothrow_copy_constructible<T>::value) {
             return try_emplace(v);
         }
 
         template <typename P, typename = std::enable_if_t<std::is_constructible_v<T, P&&>>>
-        ZRQUEUE_NODISCARD bool try_push(P&& v) noexcept(std::is_nothrow_constructible_v<T, P&&>) {
+        ZRQUEUE_NODISCARD ZRQUEUE_FORCE_INLINE bool try_push(P&& v) noexcept(std::is_nothrow_constructible_v<T, P&&>) {
             return try_emplace(std::forward<P>(v));
         }
 
@@ -676,7 +687,7 @@ namespace zrqueue {
             return count;
         }
 
-        ZRQUEUE_NODISCARD T* front() noexcept {
+        ZRQUEUE_NODISCARD ZRQUEUE_FORCE_INLINE T* front() noexcept {
             const uint64_t read_index = read_index_.load(std::memory_order_relaxed);
             if (ZRQUEUE_LIKELY(read_index < cached_write_index_)) {
                 return &reinterpret_cast<T*>(slots_memory_)[read_index & MASK];
@@ -705,7 +716,7 @@ namespace zrqueue {
             }
         }
 
-        void pop() noexcept {
+        ZRQUEUE_FORCE_INLINE void pop() noexcept {
             static_assert(std::is_nothrow_destructible<T>::value, "T must be nothrow destructible");
             const uint64_t read_index = read_index_.load(std::memory_order_relaxed);
             if constexpr (!std::is_trivially_destructible_v<T>) {
@@ -714,7 +725,7 @@ namespace zrqueue {
             read_index_.store(read_index + 1, std::memory_order_release);
         }
 
-        ZRQUEUE_NODISCARD T* peek(size_t offset = 0) noexcept {
+        ZRQUEUE_NODISCARD ZRQUEUE_FORCE_INLINE T* peek(size_t offset = 0) noexcept {
             const uint64_t read_index = read_index_.load(std::memory_order_relaxed);
             uint64_t new_read_index = read_index + offset;
             if (ZRQUEUE_LIKELY(new_read_index < cached_write_index_)) {
@@ -755,17 +766,17 @@ namespace zrqueue {
             return count_to_consume;
         }
 
-        ZRQUEUE_NODISCARD size_t size() const noexcept {
+        ZRQUEUE_NODISCARD ZRQUEUE_FORCE_INLINE size_t size() const noexcept {
             uint64_t w = write_index_.load(std::memory_order_acquire);
             uint64_t r = read_index_.load(std::memory_order_acquire);
             return (w >= r) ? static_cast<size_t>(w - r) : 0;
         }
 
-        ZRQUEUE_NODISCARD bool empty() const noexcept {
+        ZRQUEUE_NODISCARD ZRQUEUE_FORCE_INLINE bool empty() const noexcept {
             return write_index_.load(std::memory_order_acquire) == read_index_.load(std::memory_order_acquire);
         }
 
-        ZRQUEUE_NODISCARD constexpr size_t capacity() const noexcept {
+        ZRQUEUE_NODISCARD ZRQUEUE_FORCE_INLINE constexpr size_t capacity() const noexcept {
             return N; 
         }
 
@@ -802,7 +813,7 @@ namespace zrqueue {
         SpscRingBuffer(const SpscRingBuffer&) = delete;
         SpscRingBuffer& operator=(const SpscRingBuffer&) = delete;
 
-        ZRQUEUE_NODISCARD T* alloc() {
+        ZRQUEUE_NODISCARD ZRQUEUE_FORCE_INLINE T* alloc() {
             const uint64_t write_index = write_index_.load(std::memory_order_relaxed);
             if (ZRQUEUE_LIKELY(write_index - cached_read_index_ < N)) {
                 return &data_[write_index & MASK];
@@ -815,7 +826,7 @@ namespace zrqueue {
             return nullptr;
         }
 
-        void push() {
+        ZRQUEUE_FORCE_INLINE void push() {
             const uint64_t write_index = write_index_.load(std::memory_order_relaxed);
             write_index_.store(write_index + 1, std::memory_order_release);
         }
@@ -838,7 +849,7 @@ namespace zrqueue {
             }
         }
 
-        ZRQUEUE_NODISCARD T* front() {
+        ZRQUEUE_NODISCARD ZRQUEUE_FORCE_INLINE T* front() {
             const uint64_t read_index = read_index_.load(std::memory_order_relaxed);
             if (ZRQUEUE_LIKELY(read_index < cached_write_index_)) {
                 return &data_[read_index & MASK];
@@ -867,7 +878,7 @@ namespace zrqueue {
             }
         }
 
-        void pop() {
+        ZRQUEUE_FORCE_INLINE void pop() {
             const uint64_t read_index = read_index_.load(std::memory_order_relaxed);
             read_index_.store(read_index + 1, std::memory_order_release);
         }
@@ -897,17 +908,17 @@ namespace zrqueue {
             return true;
         }
 
-        ZRQUEUE_NODISCARD size_t size() const noexcept {
+        ZRQUEUE_NODISCARD ZRQUEUE_FORCE_INLINE size_t size() const noexcept {
             uint64_t w = write_index_.load(std::memory_order_acquire);
             uint64_t r = read_index_.load(std::memory_order_acquire);
             return (w >= r) ? static_cast<size_t>(w - r) : 0;
         }
 
-        ZRQUEUE_NODISCARD bool empty() const noexcept {
+        ZRQUEUE_NODISCARD ZRQUEUE_FORCE_INLINE bool empty() const noexcept {
             return write_index_.load(std::memory_order_acquire) == read_index_.load(std::memory_order_acquire);
         }
 
-        ZRQUEUE_NODISCARD constexpr size_t capacity() const noexcept {
+        ZRQUEUE_NODISCARD ZRQUEUE_FORCE_INLINE constexpr size_t capacity() const noexcept {
             return N;
         }
 
