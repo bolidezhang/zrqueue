@@ -63,7 +63,7 @@ SOFTWARE.
         #define ZRQUEUE_NODISCARD [[nodiscard]]
     #endif
 #endif
-    #ifndef ZRQUEUE_NODISCARD
+#ifndef ZRQUEUE_NODISCARD
     #define ZRQUEUE_NODISCARD
 #endif
 
@@ -107,9 +107,7 @@ SOFTWARE.
 // [微架构硬件级指令宏 (跨 CPU 架构与编译器完美兼容版)]
 // ============================================================================
 #if defined(__x86_64__) || defined(_M_X64) || defined(__i386__) || defined(_M_IX86)
-    // x86 / x64 架构
     #if defined(_MSC_VER)
-        // Windows MSVC 编译器
         #include <intrin.h>
     #else
         // GCC / Clang (Linux, macOS, MinGW)
