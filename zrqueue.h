@@ -28,7 +28,7 @@ SOFTWARE.
 
 #pragma once
 
-#define ZRQUEUE_VERSION 10404 //1.4.4
+#define ZRQUEUE_VERSION 10404   //1.4.4
 
 #include <atomic>
 #include <array>
@@ -93,8 +93,8 @@ SOFTWARE.
     #define ZRQUEUE_UNLIKELY(x)  __builtin_expect(!!(x), 0)
     #define ZRQUEUE_FORCE_INLINE inline __attribute__((always_inline))
 #else
-    #define ZRQUEUE_LIKELY(x)    (x)
-    #define ZRQUEUE_UNLIKELY(x)  (x)
+    #define ZRQUEUE_LIKELY(x)   (x)
+    #define ZRQUEUE_UNLIKELY(x) (x)
     #if defined(_MSC_VER)
         #define ZRQUEUE_FORCE_INLINE __forceinline
     #else
