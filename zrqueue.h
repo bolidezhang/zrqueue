@@ -28,7 +28,7 @@ SOFTWARE.
 
 #pragma once
 
-#define ZRQUEUE_VERSION 10404 // 1.4.4
+#define ZRQUEUE_VERSION 10404 //1.4.4
 
 #include <atomic>
 #include <array>
@@ -96,7 +96,6 @@ SOFTWARE.
     #define ZRQUEUE_LIKELY(x)    (x)
     #define ZRQUEUE_UNLIKELY(x)  (x)
     #if defined(_MSC_VER)
-        // 纯血原生 MSVC 编译器
         #define ZRQUEUE_FORCE_INLINE __forceinline
     #else
         // 未知编译器兜底 fallback
@@ -883,7 +882,7 @@ namespace zrqueue {
             read_index_.store(read_index + 1, std::memory_order_release);
         }
 
-        ZRQUEUE_NODISCARD T* peek(size_t offset = 0) noexcept {
+        ZRQUEUE_NODISCARD ZRQUEUE_FORCE_INLINE T* peek(size_t offset = 0) noexcept {
             const uint64_t read_index = read_index_.load(std::memory_order_relaxed);
             uint64_t new_read_index = read_index + offset;
             if (ZRQUEUE_LIKELY(new_read_index < cached_write_index_)) {
