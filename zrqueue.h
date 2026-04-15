@@ -350,8 +350,11 @@ namespace zrqueue {
             std::allocator_traits<Allocator>::deallocate(allocator_, slots_, capacity_);
         }
 
+        // 禁止拷贝和移动
         SpscQueue(const SpscQueue&) = delete;
         SpscQueue& operator=(const SpscQueue&) = delete;
+        SpscQueue(SpscQueue&&) = delete;
+        SpscQueue& operator=(SpscQueue&&) = delete;
 
         template <typename... Args>
         ZRQUEUE_FORCE_INLINE void emplace(Args&&...args) noexcept(std::is_nothrow_constructible<T, Args&&...>::value) {
@@ -606,6 +609,8 @@ namespace zrqueue {
         // non-copyable and non-movable
         SpscInlineQueue(const SpscInlineQueue&) = delete;
         SpscInlineQueue& operator=(const SpscInlineQueue&) = delete;
+        SpscInlineQueue(SpscInlineQueue&&) = delete;
+        SpscInlineQueue& operator=(SpscInlineQueue&&) = delete;
 
         template <typename... Args>
         ZRQUEUE_FORCE_INLINE void emplace(Args&&... args) noexcept(std::is_nothrow_constructible<T, Args&&...>::value) {
@@ -809,6 +814,8 @@ namespace zrqueue {
         // non-copyable and non-movable
         SpscRingBuffer(const SpscRingBuffer&) = delete;
         SpscRingBuffer& operator=(const SpscRingBuffer&) = delete;
+        SpscRingBuffer(SpscRingBuffer&&) = delete;
+        SpscRingBuffer& operator=(SpscRingBuffer&&) = delete;
 
         ZRQUEUE_NODISCARD ZRQUEUE_FORCE_INLINE T* alloc() {
             const uint64_t write_index = write_index_.load(std::memory_order_relaxed);
