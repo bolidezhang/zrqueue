@@ -1,5 +1,5 @@
-﻿// benchmark.cpp - 对比 zrqueue 与 rigtorp::SPSCQueue 性能
-// 支持 Windows (MSVC/MinGW) 和 Linux (GCC/Clang)
+﻿// benchmark.cpp - Benchmark zrqueue vs rigtorp::SPSCQueue
+// Supports Windows (MSVC/MinGW) and Linux (GCC/Clang)
 
 #include "zrqueue.h"
 #include "rigtorp/SPSCQueue.h"
@@ -11,14 +11,14 @@
 #include <cstring>
 #include <atomic>
 
-// ========== 跨平台线程绑定 (CPU Affinity) ==========
+// ========== Cross-Platform Thread Pinning (CPU Affinity) ==========
 #if defined(_WIN32)
     #include <windows.h>
     static void pinThread(int cpu) {
         if (cpu < 0) {
             return;
         }
-        // 将线程绑定到指定逻辑处理器 (仅支持前 64 个核心)
+        // Pin thread to the specified logical processor (supports up to the first 64 cores)
         DWORD_PTR mask = (cpu < 64) ? (DWORD_PTR)1 << cpu : (DWORD_PTR)-1;
         SetThreadAffinityMask(GetCurrentThread(), mask);
     }
@@ -36,7 +36,7 @@
     }
 #else
     static void pinThread(int) {
-        // 其他平台：不做绑定
+        // Other platforms: No pinning
     }
 #endif
 
