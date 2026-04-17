@@ -1,7 +1,7 @@
 cmake_minimum_required(VERSION 3.14)
 project(Benchmark VERSION 1.0 LANGUAGES CXX)
 
-# 速度优先的编译选项
+# Performance-optimized compilation flags
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_POSITION_INDEPENDENT_CODE ON)
@@ -20,22 +20,22 @@ elseif(CMAKE_CXX_COMPILER_ID STREQUAL "MSVC")
     set(CMAKE_EXE_LINKER_FLAGS "${CMAKE_EXE_LINKER_FLAGS} /LTCG")
 endif()
 
-# 查找线程库（必须在使用 Threads::Threads 之前）
+# Find thread library (must be before using Threads::Threads)
 find_package(Threads REQUIRED)
 
-# 可执行文件
+# Executable target
 add_executable(benchmark benchmark.cpp)
 
-# 包含路径：当前目录 (zrqueue.h) + 子模块中的 rigtorp 头文件
+# Include paths: Current directory (zrqueue.h) + rigtorp headers in submodule
 target_include_directories(benchmark PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}
     ${CMAKE_CURRENT_SOURCE_DIR}/third_party/rigtorp/include
 )
 
-# 链接线程库
+# Link thread library
 target_link_libraries(benchmark PRIVATE Threads::Threads)
 
-# 静态链接 (可选)
+# Static linking (optional)
 if(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
     target_link_options(benchmark PRIVATE -static-libstdc++ -static-libgcc)
 endif()
