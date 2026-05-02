@@ -43,9 +43,9 @@ SOFTWARE.
 #include <type_traits>
 #include <utility>
 
-  // ============================================================================
-  // [Platform and OS Low-Level API Detection]
-  // ============================================================================
+// ============================================================================
+// [Platform and OS Low-Level API Detection]
+// ============================================================================
 #if defined(_MSC_VER) || defined(__MINGW32__)
     #define ZRQUEUE_OS_WINDOWS 1
     #include <windows.h>
@@ -939,7 +939,7 @@ namespace zrqueue {
         alignas(ZRQUEUE_CACHE_LINE_SIZE) uint64_t cached_write_index_ { 0 };
 
         // Data Zone
-        alignas(ZRQUEUE_CACHE_LINE_SIZE) std::array<T, N> data_{ };
+        alignas(ZRQUEUE_CACHE_LINE_SIZE) std::array<T, N> data_ { };
     };  // end SpscRingBuffer
 
 }   // end namespace zrqueue
