@@ -28,7 +28,7 @@ SOFTWARE.
 
 #pragma once
 
-#define ZRQUEUE_VERSION 10501   //1.5.1
+#define ZRQUEUE_VERSION 10800   //1.8.0
 
 #include <atomic>
 #include <array>
@@ -133,7 +133,8 @@ namespace zrqueue {
     // [Low-Level Memory / Math Helper Functions]
     // ============================================================================
 
-    // Round up to the next power of 2 (Ensures branchless mask addressing)
+    // Round up to the next power of 2 (Ensures branchless mask addressing).
+    // Note: requests above 2^30 elements are silently clamped to 2^30.
     inline constexpr uint32_t normalize_size(uint32_t n) noexcept {
         constexpr uint32_t MIN_SIZE = 2;
         constexpr uint32_t MAX_POW2 = 1u << 30;
@@ -161,19 +162,13 @@ namespace zrqueue {
         return (size + alignment - 1) & ~(alignment - 1);
     }
 
-    // Cross-platform detection of system huge page size
-    inline size_t get_hugepage_size() noexcept {
-        static size_t hp_size = 0;
-        if (hp_size != 0) {
-            return hp_size;
-        }
+    // Cross-platform detection of system huge page size (one-shot probe)
+    inline size_t detect_hugepage_size() noexcept {
 #if defined(ZRQUEUE_OS_WINDOWS)
-        hp_size = GetLargePageMinimum();
-        if (hp_size == 0) {
-            hp_size = 1; // Fallback to prevent division by zero
-        }
+        size_t hp_size = GetLargePageMinimum();
+        return hp_size != 0 ? hp_size : 1; // Fallback to prevent division by zero
 #elif defined(ZRQUEUE_OS_POSIX)
-        hp_size = 2 * 1024 * 1024; // Linux default fallback to 2MB
+        size_t hp_size = 2 * 1024 * 1024; // Linux default fallback to 2MB
         int fd = open("/proc/meminfo", O_RDONLY);
         if (fd != -1) {
             char buffer[1024];
@@ -190,8 +185,30 @@ namespace zrqueue {
             }
             close(fd);
         }
-#endif
         return hp_size;
+#else
+        return 1;
+#endif
+    }
+
+    // Cross-platform detection of system huge page size.
+    // Cached via magic static: initialization is thread-safe by the language, no data race.
+    inline size_t get_hugepage_size() noexcept {
+        static const size_t hp_size = detect_hugepage_size();
+        return hp_size;
+    }
+
+    namespace detail {
+        // Set when HugePageAllocator cannot obtain huge pages and silently downgrades
+        // to normal pages. Written once on the cold allocation path, read never on hot paths.
+        inline std::atomic<bool> g_hugepage_fallback { false };
+    } // namespace detail
+
+    // Returns true if any HugePageAllocator allocation fell back to normal (4KB) pages.
+    // The fallback is graceful but was silent before 1.7.0; check once at startup to
+    // confirm huge pages are actually in effect (e.g. hugetlbfs reserved / SeLockMemoryPrivilege held).
+    inline bool hugepage_fallback_occurred() noexcept {
+        return detail::g_hugepage_fallback.load(std::memory_order_relaxed);
     }
 
     // ============================================================================
@@ -281,6 +298,7 @@ namespace zrqueue {
                 if (ptr == MAP_FAILED) {
                     throw std::bad_alloc();
                 }
+                detail::g_hugepage_fallback.store(true, std::memory_order_relaxed);
             }
 #elif defined(ZRQUEUE_OS_WINDOWS)
             if (hp_size > 1) {
@@ -295,6 +313,7 @@ namespace zrqueue {
                 if (!ptr) {
                     throw std::bad_alloc();
                 }
+                detail::g_hugepage_fallback.store(true, std::memory_order_relaxed);
             }
 #endif
             return static_cast<T*>(ptr);
@@ -331,19 +350,30 @@ namespace zrqueue {
     }
 
     // ============================================================================
-    // [Ultra-Fast Lock-Free SpscQueue]
+    // [Ultra-Fast Lock-Free SpscHeapQueue]
     // ============================================================================
     template <typename T, typename Allocator = AlignedAllocator<T, ZRQUEUE_CACHE_LINE_SIZE>>
-    class SpscQueue {
+    class SpscHeapQueue {
     public:
-        explicit SpscQueue(const uint32_t capacity, const Allocator& allocator = Allocator())
+        explicit SpscHeapQueue(const uint32_t capacity, const Allocator& allocator = Allocator())
             : capacity_(normalize_size(capacity)), allocator_(allocator) {
             mask_ = capacity_ - 1;
             // Allocate physically contiguous memory. Custom Allocator perfectly resolves head/tail false sharing, no manual padding needed.
             slots_ = std::allocator_traits<Allocator>::allocate(allocator_, capacity_);
+
+            // [Core Defense]: Pre-fault every OS page at startup so the live phase never pays
+            // first-touch page-fault spikes (~5us each). One byte per page suffices (a 2MB huge
+            // page faults in entirely on first touch). A fixed 4KB step is safe on any base-page
+            // size: stepping smaller than the real page only touches some pages twice.
+            // Matches the pre-warming semantics of SpscInlineQueue (.BSS) and SpscRingBuffer (data_{}).
+            volatile char* touch = reinterpret_cast<volatile char*>(slots_);
+            const size_t total_bytes = static_cast<size_t>(capacity_) * sizeof(T);
+            for (size_t off = 0; off < total_bytes; off += 4096) {
+                touch[off] = 0;
+            }
         }
 
-        ~SpscQueue() {
+        ~SpscHeapQueue() {
             while (front()) {
                 pop();
             }
@@ -351,10 +381,10 @@ namespace zrqueue {
         }
 
         // Disable copy and move
-        SpscQueue(const SpscQueue&) = delete;
-        SpscQueue& operator=(const SpscQueue&) = delete;
-        SpscQueue(SpscQueue&&) = delete;
-        SpscQueue& operator=(SpscQueue&&) = delete;
+        SpscHeapQueue(const SpscHeapQueue&) = delete;
+        SpscHeapQueue& operator=(const SpscHeapQueue&) = delete;
+        SpscHeapQueue(SpscHeapQueue&&) = delete;
+        SpscHeapQueue& operator=(SpscHeapQueue&&) = delete;
 
         template <typename... Args>
         ZRQUEUE_FORCE_INLINE void emplace(Args&&...args) noexcept(std::is_nothrow_constructible_v<T, Args&&...>) {
@@ -365,6 +395,9 @@ namespace zrqueue {
             // [Mechanism]: Fetch latest consumer index across cores only when local cache indicates full (Cache Ping-Pong Defense)
             while (ZRQUEUE_UNLIKELY(next_write_index - cached_read_index_ > capacity_)) {
                 cached_read_index_ = read_index_.load(std::memory_order_acquire);
+                // [Mechanism]: _mm_pause relaxes hammering on the consumer's cache line,
+                // otherwise every consumer release-store pays an RFO round-trip (measured 1.7-2.3x at small capacity)
+                ZRQUEUE_CPU_PAUSE();
             }
 
             // [Mechanism]: Pure bitwise addressing + Placement new (Zero-Branching & Zero-Initialization Penalty)
@@ -515,6 +548,7 @@ namespace zrqueue {
         // ------------------------------------------------------------------------
         template <typename THandler>
         ZRQUEUE_NODISCARD size_t consume_bulk(THandler&& handler, size_t max_count = 0) noexcept {
+            static_assert(std::is_nothrow_destructible_v<T>, "T must be nothrow destructible");
             const uint64_t read_index = read_index_.load(std::memory_order_relaxed);
 
             // 1. Get current number of backlogged elements
@@ -580,7 +614,11 @@ namespace zrqueue {
 
         // [Cache Line]: Allocator occupies independent space
         alignas(ZRQUEUE_CACHE_LINE_SIZE) Allocator allocator_ { };
-    };  // end SpscQueue
+    };  // end SpscHeapQueue
+
+    // Backward-compatible alias for the pre-1.6.0 name. New code should use SpscHeapQueue.
+    template <typename T, typename Allocator = AlignedAllocator<T, ZRQUEUE_CACHE_LINE_SIZE>>
+    using SpscQueue [[deprecated("Renamed to SpscHeapQueue")]] = SpscHeapQueue<T, Allocator>;
 
     /**
      * @brief Extreme in-place SPSC Queue
@@ -616,6 +654,7 @@ namespace zrqueue {
 
             while (ZRQUEUE_UNLIKELY(next_write_index - cached_read_index_ > N)) {
                 cached_read_index_ = read_index_.load(std::memory_order_acquire);
+                ZRQUEUE_CPU_PAUSE();
             }
 
             // [Extreme Base Addressing]: No longer dereferencing slots_ pointer,
@@ -740,6 +779,7 @@ namespace zrqueue {
 
         template <typename THandler>
         ZRQUEUE_NODISCARD size_t consume_bulk(THandler&& handler, size_t max_count = 0) noexcept {
+            static_assert(std::is_nothrow_destructible_v<T>, "T must be nothrow destructible");
             const uint64_t read_index = read_index_.load(std::memory_order_relaxed);
 
             if (ZRQUEUE_UNLIKELY(read_index == cached_write_index_)) {
@@ -828,13 +868,95 @@ namespace zrqueue {
                 }
             }
 
+#ifndef NDEBUG
+            // A second alloc() before push()/commit() would return and overwrite the SAME slot
+            assert(pending_claim_ == 0 && "alloc() called again before push()/commit(): previous claim not committed");
+            pending_claim_ = 1;
+#endif
             return &data_[write_index & MASK];
         }
 
+        // Busy-wait variant of alloc(): spins (with CPU pause) until a slot is free.
+        // Producer-side counterpart of spin_front().
+        ZRQUEUE_NODISCARD T* spin_alloc() noexcept {
+            const uint64_t write_index = write_index_.load(std::memory_order_relaxed);
+            const uint64_t next_write_index = write_index + 1;
+
+            while (ZRQUEUE_UNLIKELY(next_write_index - cached_read_index_ > N)) {
+                cached_read_index_ = read_index_.load(std::memory_order_acquire);
+                ZRQUEUE_CPU_PAUSE();
+            }
+
+#ifndef NDEBUG
+            assert(pending_claim_ == 0 && "spin_alloc() called again before push()/commit(): previous claim not committed");
+            pending_claim_ = 1;
+#endif
+            return &data_[write_index & MASK];
+        }
+
+        // ------------------------------------------------------------------------
+        // Bulk Claim (Disruptor-style)
+        // Scenario: Gateway receives a burst via recvmmsg, claims slots once, writes
+        // in-place, commits all with ONE release barrier via commit(n).
+        // Claims up to `want` consecutive slots; returns pointer to the first slot and
+        // sets `granted` to the number actually claimed (nullptr / granted==0 when full).
+        // The run NEVER straddles the ring's wrap point: `granted` may be smaller than
+        // the free space if the remainder wraps; call alloc_bulk() again after commit()
+        // to claim the rest. Single-producer: hot path reads only its own cache line.
+        // ------------------------------------------------------------------------
+        ZRQUEUE_NODISCARD T* alloc_bulk(size_t want, size_t& granted) noexcept {
+            granted = 0;
+            if (ZRQUEUE_UNLIKELY(want == 0)) {
+                return nullptr;
+            }
+            const uint64_t write_index = write_index_.load(std::memory_order_relaxed);
+
+            // Free space from the cached view; refresh across cores only when the cache says insufficient
+            uint64_t free_count = N - (write_index - cached_read_index_);
+            if (ZRQUEUE_UNLIKELY(free_count < want)) {
+                cached_read_index_ = read_index_.load(std::memory_order_acquire);
+                free_count = N - (write_index - cached_read_index_);
+                if (ZRQUEUE_UNLIKELY(free_count == 0)) {
+                    return nullptr;
+                }
+            }
+
+            size_t count = want < free_count ? want : static_cast<size_t>(free_count);
+            const size_t offset = static_cast<size_t>(write_index & MASK);
+            const size_t till_wrap = N - offset; // slots from here to the physical end of data_
+            if (count > till_wrap) {
+                count = till_wrap; // contiguous-run semantics: never straddle the wrap point
+            }
+
+#ifndef NDEBUG
+            assert(pending_claim_ == 0 && "alloc_bulk() called again before commit(): previous claim not committed");
+            pending_claim_ = count;
+#endif
+            granted = count;
+            return &data_[offset];
+        }
+
         ZRQUEUE_FORCE_INLINE void push() {
+#ifndef NDEBUG
+            // push() commits exactly ONE slot; committing a bulk claim slot-by-slot would
+            // silently strand the rest (never visible to the consumer, later re-claimed)
+            assert(pending_claim_ == 1 && "push() commits a single alloc(); use commit(n) for alloc_bulk()");
+            pending_claim_ = 0;
+#endif
             const uint64_t write_index = write_index_.load(std::memory_order_relaxed);
             const uint64_t next_write_index = write_index + 1;
             write_index_.store(next_write_index, std::memory_order_release);
+        }
+
+        // Commits n slots of a pending alloc_bulk() claim (n <= granted) with exactly ONE
+        // release barrier. Slots beyond n are silently abandoned and re-claimed by a future alloc.
+        ZRQUEUE_FORCE_INLINE void commit(size_t n) {
+#ifndef NDEBUG
+            assert(n >= 1 && n <= pending_claim_ && "commit(n): n must be within the pending alloc_bulk() claim");
+            pending_claim_ = 0;
+#endif
+            const uint64_t write_index = write_index_.load(std::memory_order_relaxed);
+            write_index_.store(write_index + n, std::memory_order_release);
         }
 
         template<typename Writer>
@@ -913,6 +1035,35 @@ namespace zrqueue {
             return false;
         }
 
+        // ------------------------------------------------------------------------
+        // Bulk Zero-Copy Consume
+        // Advantage: Pass Lambda for in-place processing, executes ONLY ONE Release barrier.
+        // Unlike the placement-new queues, elements are never destructed (pre-constructed
+        // ring); the handler receives T& and must leave the slot reusable.
+        // max_count defaults to 0, meaning "consume as many as available".
+        // ------------------------------------------------------------------------
+        template <typename THandler>
+        ZRQUEUE_NODISCARD size_t consume_bulk(THandler&& handler, size_t max_count = 0) noexcept {
+            const uint64_t read_index = read_index_.load(std::memory_order_relaxed);
+
+            if (ZRQUEUE_UNLIKELY(read_index == cached_write_index_)) {
+                cached_write_index_ = write_index_.load(std::memory_order_acquire);
+                if (ZRQUEUE_UNLIKELY(read_index == cached_write_index_)) {
+                    return 0; // Ring is empty
+                }
+            }
+
+            const size_t available = static_cast<size_t>(cached_write_index_ - read_index);
+            const size_t count_to_consume = (max_count == 0 || max_count > available) ? available : max_count;
+
+            for (size_t i = 0; i < count_to_consume; ++i) {
+                std::forward<THandler>(handler)(data_[(read_index + i) & MASK]);
+            }
+
+            read_index_.store(read_index + count_to_consume, std::memory_order_release);
+            return count_to_consume;
+        }
+
         ZRQUEUE_NODISCARD ZRQUEUE_FORCE_INLINE size_t size() const noexcept {
             uint64_t w = write_index_.load(std::memory_order_acquire);
             uint64_t r = read_index_.load(std::memory_order_acquire);
@@ -933,6 +1084,12 @@ namespace zrqueue {
         // [Cache Line]: Producer Zone
         alignas(ZRQUEUE_CACHE_LINE_SIZE) std::atomic<uint64_t> write_index_{ 0 };
         alignas(ZRQUEUE_CACHE_LINE_SIZE) uint64_t cached_read_index_ { 0 };
+#ifndef NDEBUG
+        // Debug-only misuse detector: number of claimed-but-uncommitted slots
+        // (1 from alloc()/spin_alloc(), k from alloc_bulk()). Producer-local,
+        // shares the line above (no layout impact).
+        size_t pending_claim_ = 0;
+#endif
 
         // [Cache Line]: Consumer Zone
         alignas(ZRQUEUE_CACHE_LINE_SIZE) std::atomic<uint64_t> read_index_{ 0 };
@@ -941,5 +1098,271 @@ namespace zrqueue {
         // Data Zone
         alignas(ZRQUEUE_CACHE_LINE_SIZE) std::array<T, N> data_ { };
     };  // end SpscRingBuffer
+
+    // ============================================================================
+    // [Latency-Optimized Lock-Free Queue SpscMirrorQueue (Latest-K Element Mirroring)]
+    // ============================================================================
+    // Idea: in classic SPSC (the three queues above), delivering a near-empty-queue
+    // element costs TWO cross-core cache-line migrations: the index line
+    // (write_index_) and the data line (the slot). Here the producer additionally
+    // packs every pushed element - for sizeof(T) <= 4 - into an 8-byte atomic entry
+    // {seq:u32 | payload:u32} living in its OWN index line (the line the consumer's
+    // polling load fetches anyway). The consumer's acquire-load of write_index_
+    // returns the index AND brings the payload along; the entry is then read as a
+    // plain L1 hit, atomically - no torn reads, no re-validation.
+    // Ping-pong round-trip: 4 line migrations -> 2 (~40% lower RTT, measured).
+    //
+    // Safety: availability is still detected via the monotonic write_index_ (never
+    // missed, even if the producer laps the 4-entry mirror ring). The entry for
+    // element r is only overwritten by element r+K, whose store happens-before
+    // write_index_ reaches r+K+1; the consumer gates the fast path on depth <= K
+    // and double-checks entry.seq == r, falling back to the packed slots otherwise.
+    // Slots always hold authoritative data (the classic protocol is fully
+    // preserved), so pop() always destructs the slot, mirror hit or not.
+    //
+    // Deep-backlog throughput path is untouched: packed slots, cached remote
+    // indices, one release store per push. The mirror adds exactly one extra store
+    // to the producer's OWN line per push (~1 cycle), and in shallow flow REMOVES
+    // the data-line migration classic SPSC pays per element.
+    //
+    // Mirror is enabled only for trivially-copyable T with sizeof(T) <= 4 (K = 4
+    // packed 8-byte entries fit the 48B left in the index line; power-of-2 K so
+    // ring indexing is a mask). Larger/non-copyable types transparently fall back
+    // to the classic path with identical semantics.
+    //
+    // Deliberately minimal API (RTT-focused): no bulk ops - use SpscRingBuffer or
+    // SpscInlineQueue for burst workloads.
+    template <typename T, uint32_t N>
+    class SpscMirrorQueue {
+        static_assert(N >= 2, "Capacity must be at least 2");
+        static_assert((N & (N - 1)) == 0, "Capacity N must be a power of 2 for bitwise masking");
+
+        static constexpr uint32_t MASK = N - 1;
+
+        static constexpr bool MIRROR_OK =
+            std::is_trivially_copyable_v<T> && sizeof(T) <= 4 && alignof(T) <= 8;
+        static constexpr size_t MIRROR_K = MIRROR_OK ? 4 : 0;
+        static constexpr size_t MIRROR_MASK = MIRROR_K - 1;
+        static constexpr uint64_t EMPTY_ENTRY = 0xFFFFFFFF00000000ULL; // seq = UINT32_MAX, never matches
+
+    public:
+        SpscMirrorQueue() noexcept {
+            if constexpr (MIRROR_OK) {
+                for (size_t i = 0; i < MIRROR_K; ++i) {
+                    mirror_entries_[i].store(EMPTY_ENTRY, std::memory_order_relaxed);
+                }
+            }
+            // [Core Defense]: Pre-fault every OS page of the slot array at startup so the
+            // live phase never pays first-touch page-fault spikes (~1-5us each). This
+            // class has a user-provided constructor, so unlike SpscInlineQueue it gets
+            // NO value-init zeroing for free - at 16M ints a fresh heap object would
+            // otherwise take ~10K faults during the live phase (~3x throughput hit).
+            volatile char* touch = reinterpret_cast<volatile char*>(slots_);
+            for (size_t off = 0; off < static_cast<size_t>(N) * sizeof(T); off += 4096) {
+                touch[off] = 0;
+            }
+        }
+        ~SpscMirrorQueue() {
+            while (front()) {
+                pop();
+            }
+        }
+
+        // non-copyable and non-movable
+        SpscMirrorQueue(const SpscMirrorQueue&) = delete;
+        SpscMirrorQueue& operator=(const SpscMirrorQueue&) = delete;
+        SpscMirrorQueue(SpscMirrorQueue&&) = delete;
+        SpscMirrorQueue& operator=(SpscMirrorQueue&&) = delete;
+
+        template <typename... Args>
+        ZRQUEUE_FORCE_INLINE void emplace(Args&&... args) noexcept(std::is_nothrow_constructible_v<T, Args&&...>) {
+            static_assert(std::is_constructible_v<T, Args&&...>, "T must be constructible with Args&&...");
+            const uint64_t write_index = write_index_.load(std::memory_order_relaxed);
+            const uint64_t next_write_index = write_index + 1;
+
+            while (ZRQUEUE_UNLIKELY(next_write_index - cached_read_index_ > N)) {
+                cached_read_index_ = read_index_.load(std::memory_order_acquire);
+                ZRQUEUE_CPU_PAUSE();
+            }
+
+            T* slot = slot_at(write_index);
+            new (slot) T(std::forward<Args>(args)...);
+            mirror(write_index, slot); // packed store into own line, ordered before the release below
+            write_index_.store(next_write_index, std::memory_order_release);
+        }
+
+        template <typename... Args>
+        ZRQUEUE_NODISCARD ZRQUEUE_FORCE_INLINE bool try_emplace(Args&&... args) noexcept(std::is_nothrow_constructible_v<T, Args&&...>) {
+            static_assert(std::is_constructible_v<T, Args&&...>, "T must be constructible with Args&&...");
+            const uint64_t write_index = write_index_.load(std::memory_order_relaxed);
+            const uint64_t next_write_index = write_index + 1;
+
+            if (ZRQUEUE_UNLIKELY(next_write_index - cached_read_index_ > N)) {
+                cached_read_index_ = read_index_.load(std::memory_order_acquire);
+                if (ZRQUEUE_UNLIKELY(next_write_index - cached_read_index_ > N)) {
+                    return false;
+                }
+            }
+
+            T* slot = slot_at(write_index);
+            new (slot) T(std::forward<Args>(args)...);
+            mirror(write_index, slot);
+            write_index_.store(next_write_index, std::memory_order_release);
+            return true;
+        }
+
+        ZRQUEUE_FORCE_INLINE void push(const T& v) noexcept(std::is_nothrow_copy_constructible_v<T>) {
+            emplace(v);
+        }
+
+        template <typename P, typename = std::enable_if_t<std::is_constructible_v<T, P&&>>>
+        ZRQUEUE_FORCE_INLINE void push(P&& v) noexcept(std::is_nothrow_constructible_v<T, P&&>) {
+            emplace(std::forward<P>(v));
+        }
+
+        ZRQUEUE_NODISCARD ZRQUEUE_FORCE_INLINE bool try_push(const T& v) noexcept(std::is_nothrow_copy_constructible_v<T>) {
+            return try_emplace(v);
+        }
+
+        template <typename P, typename = std::enable_if_t<std::is_constructible_v<T, P&&>>>
+        ZRQUEUE_NODISCARD ZRQUEUE_FORCE_INLINE bool try_push(P&& v) noexcept(std::is_nothrow_constructible_v<T, P&&>) {
+            return try_emplace(std::forward<P>(v));
+        }
+
+        ZRQUEUE_NODISCARD ZRQUEUE_FORCE_INLINE T* front() noexcept {
+            const uint64_t read_index = read_index_.load(std::memory_order_relaxed);
+            if (ZRQUEUE_LIKELY(read_index != cached_write_index_)) {
+                return slot_at(read_index); // deep backlog: packed-slot path (authoritative)
+            }
+            const uint64_t w1 = write_index_.load(std::memory_order_acquire);
+            if (ZRQUEUE_UNLIKELY(read_index == w1)) {
+                return nullptr;
+            }
+            cached_write_index_ = w1;
+            if (T* m = try_mirror(read_index, w1)) {
+                return m;
+            }
+            return slot_at(read_index);
+        }
+
+        ZRQUEUE_NODISCARD T* spin_front() noexcept {
+            const uint64_t read_index = read_index_.load(std::memory_order_relaxed);
+            if (ZRQUEUE_LIKELY(read_index != cached_write_index_)) {
+                return slot_at(read_index);
+            }
+            while (true) {
+                const uint64_t w1 = write_index_.load(std::memory_order_acquire);
+                if (ZRQUEUE_LIKELY(read_index != w1)) {
+                    cached_write_index_ = w1;
+                    if (T* m = try_mirror(read_index, w1)) {
+                        return m;
+                    }
+                    return slot_at(read_index);
+                }
+                ZRQUEUE_CPU_PAUSE();
+            }
+        }
+
+        ZRQUEUE_FORCE_INLINE void pop() noexcept {
+            static_assert(std::is_nothrow_destructible_v<T>, "T must be nothrow destructible");
+            const uint64_t read_index = read_index_.load(std::memory_order_relaxed);
+            if constexpr (!std::is_trivially_destructible_v<T>) {
+                slot_at(read_index)->~T(); // slot always holds a constructed element, mirror or not
+            }
+            read_index_.store(read_index + 1, std::memory_order_release);
+        }
+
+        // Reads the authoritative slot directly (mirroring is a front()-path
+        // optimization only); the slot is always valid for any in-queue element.
+        ZRQUEUE_NODISCARD ZRQUEUE_FORCE_INLINE T* peek(size_t offset = 0) noexcept {
+            const uint64_t read_index = read_index_.load(std::memory_order_relaxed);
+            const uint64_t new_read_index = read_index + offset;
+            if (ZRQUEUE_UNLIKELY(new_read_index >= cached_write_index_)) {
+                cached_write_index_ = write_index_.load(std::memory_order_acquire);
+                if (ZRQUEUE_UNLIKELY(new_read_index >= cached_write_index_)) {
+                    return nullptr;
+                }
+            }
+            return slot_at(new_read_index);
+        }
+
+        ZRQUEUE_NODISCARD ZRQUEUE_FORCE_INLINE size_t size() const noexcept {
+            const uint64_t w = write_index_.load(std::memory_order_acquire);
+            const uint64_t r = read_index_.load(std::memory_order_acquire);
+            return (w >= r) ? static_cast<size_t>(w - r) : 0;
+        }
+
+        ZRQUEUE_NODISCARD ZRQUEUE_FORCE_INLINE bool empty() const noexcept {
+            return write_index_.load(std::memory_order_acquire) ==
+                   read_index_.load(std::memory_order_acquire);
+        }
+
+        ZRQUEUE_NODISCARD ZRQUEUE_FORCE_INLINE constexpr size_t capacity() const noexcept {
+            return N;
+        }
+
+    private:
+        ZRQUEUE_FORCE_INLINE T* slot_at(uint64_t index) noexcept {
+            return &reinterpret_cast<T*>(slots_)[index & MASK];
+        }
+
+        // Producer: pack {seq32 | payload32} into the mirror entry (own line, one store).
+        ZRQUEUE_FORCE_INLINE void mirror(uint64_t write_index, const T* slot) noexcept {
+            if constexpr (MIRROR_OK) {
+                uint32_t lo = 0;
+                std::memcpy(&lo, slot, sizeof(T));
+                mirror_entries_[write_index & MIRROR_MASK].store(
+                    (static_cast<uint64_t>(static_cast<uint32_t>(write_index)) << 32) | lo,
+                    std::memory_order_relaxed);
+            }
+        }
+
+        // Consumer: single atomic load of the mirror entry - seq and payload arrive
+        // together, torn reads impossible, no re-validation needed. The entry rides the
+        // same cache line as write_index_, so after the acquire-load above this is an
+        // L1 hit. The unpacked element is stashed on the consumer's OWN line, so the
+        // fast path never touches any other shared state.
+        ZRQUEUE_FORCE_INLINE T* try_mirror(uint64_t read_index, uint64_t w1) noexcept {
+            if constexpr (MIRROR_OK) {
+                if (w1 - read_index <= MIRROR_K) {
+                    const uint64_t e = mirror_entries_[read_index & MIRROR_MASK].load(std::memory_order_relaxed);
+                    if (ZRQUEUE_LIKELY(static_cast<uint32_t>(e >> 32) == static_cast<uint32_t>(read_index))) {
+                        const uint32_t lo = static_cast<uint32_t>(e);
+                        std::memcpy(&mirror_stash_, &lo, sizeof(T));
+                        return &mirror_stash_;
+                    }
+                }
+            }
+            return nullptr;
+        }
+
+        // [Cache Line PAIR 0: Producer Zone]. The packed entries share write_index_'s
+        // line so the consumer's polling load fetches index + payload in ONE cross-core
+        // migration. The buddy pad keeps the 2-line L2 adjacent-line prefetch pair
+        // single-owner: prefetching write_index_'s line only ever pulls producer-owned
+        // bytes, never the consumer's read_index_ line.
+        alignas(2 * ZRQUEUE_CACHE_LINE_SIZE) std::atomic<uint64_t> write_index_{ 0 };
+        uint64_t cached_read_index_{ 0 };
+        std::atomic<uint64_t> mirror_entries_[MIRROR_OK ? MIRROR_K : 1];
+        static constexpr size_t PROD_LINE_USED = 16 + (MIRROR_OK ? MIRROR_K : 1) * 8;
+        static_assert(PROD_LINE_USED <= ZRQUEUE_CACHE_LINE_SIZE,
+                      "mirror entries must fit the producer cache line");
+        std::byte producer_tail_pad_[PROD_LINE_USED < ZRQUEUE_CACHE_LINE_SIZE
+                                       ? ZRQUEUE_CACHE_LINE_SIZE - PROD_LINE_USED : 1];
+        std::byte producer_buddy_pad_[ZRQUEUE_CACHE_LINE_SIZE]; // prefetch buddy, never touched
+
+        // [Cache Line PAIR 1: Consumer Zone]. mirror_stash_ lives on the consumer's own
+        // line so the unpack never touches shared state. Tail pad covers the rest of the
+        // consumer line plus the untouched prefetch buddy line.
+        alignas(2 * ZRQUEUE_CACHE_LINE_SIZE) std::atomic<uint64_t> read_index_{ 0 };
+        uint64_t cached_write_index_{ 0 };
+        alignas(T) T mirror_stash_{};
+        static constexpr size_t CONS_LINE_USED = 16 + sizeof(T);
+        std::byte consumer_tail_pad_[CONS_LINE_USED < 2 * ZRQUEUE_CACHE_LINE_SIZE
+                                       ? 2 * ZRQUEUE_CACHE_LINE_SIZE - CONS_LINE_USED : 1];
+
+        // [Data Zone]: packed authoritative slots (classic path, deep backlog)
+        alignas(2 * ZRQUEUE_CACHE_LINE_SIZE) alignas(T) std::byte slots_[N * sizeof(T)];
+    };  // end SpscMirrorQueue
 
 }   // end namespace zrqueue
