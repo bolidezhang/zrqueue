@@ -11,6 +11,14 @@
 //    front() twice per element re-reads the slot line after the mirror path already
 //    delivered the payload - neutral for classic queues (second call is a cheap
 //    fast path), but it silently voids SpscMirrorQueue's index-line piggyback.
+//
+// Usage: benchmark [consumer-core producer-core] [options]
+//   --help / -h       print full usage
+//   --rt              raise priority to reduce OS scheduling jitter
+//   --rtt-only        RTT percentile tables only
+//   --depth-only      controlled-backlog + RingBuffer diagnostics only
+//   --depth=N         single backlog depth (0 = uncontrolled, 0<N<32 clamped)
+// Run with --help for the complete description and examples.
 
 #include "zrqueue.h"
 #include "rigtorp/SPSCQueue.h"
@@ -940,6 +948,45 @@ static void runRingPathDiag(int cpu1, int cpu2) {
     }
 }
 
+static void printUsage(const char* exe) {
+    std::printf(
+        "Usage: %s [consumer-core producer-core] [options]\n"
+        "\n"
+        "Positional (omit both to leave the threads unpinned):\n"
+        "  consumer-core    logical CPU for the consumer thread\n"
+        "  producer-core    logical CPU for the producer thread\n"
+        "  A negative value disables pinning for that side.\n"
+        "\n"
+        "Options (may appear anywhere):\n"
+        "  --help, -h           print this help and exit\n"
+        "  --rt                 raise process/thread priority to cut OS jitter:\n"
+        "                       HIGH_PRIORITY_CLASS + THREAD_PRIORITY_TIME_CRITICAL\n"
+        "                       on Windows, SCHED_FIFO on Linux (needs root/CAP_SYS_NICE)\n"
+        "  --rtt-only           run only the TSC-sampled RTT percentile tables\n"
+        "  --depth-only         run only controlled-backlog + RingBuffer path diagnostics\n"
+        "  --depth=N            run one backlog depth instead of the sweep.\n"
+        "                       N=0 means uncontrolled; 0<N<32 is clamped to 32\n"
+        "                       because the credit counter is amortized over 16 items\n"
+        "\n"
+        "Suites (default: all of them):\n"
+        "  throughput + RTT at capacities 4096 and 16M\n"
+        "  payload length sweep 4B..1KB plus a non-POD row\n"
+        "  controlled-backlog sweep and RingBuffer producer-path diagnosis\n"
+        "  RTT percentiles p50/p90/p99/p99.9 (one TSC read per RTT)\n"
+        "\n"
+        "Output: throughput in ops/ms, latency in ns. Every suite rotates the\n"
+        "variant order per rep to cancel execution-order bias.\n"
+        "\n"
+        "Examples:\n"
+        "  benchmark 2 4                        full run on cores 2/4\n"
+        "  benchmark 2 4 --rt                   same, with reduced scheduling jitter\n"
+        "  benchmark 2 4 --rtt-only --rt        ns-level percentiles only\n"
+        "  benchmark 1 3 --depth-only           backlog diagnosis on a 4-vCPU host\n"
+        "  benchmark 2 4 --depth-only --depth=128\n"
+        "  benchmark --help                     this text\n",
+        exe);
+}
+
 int main(int argc, char* argv[]) {
     int cpu1 = -1; // consumer
     int cpu2 = -1; // producer
@@ -948,19 +995,44 @@ int main(int argc, char* argv[]) {
     bool depthOnly = false;
     int64_t depthArg = -1;
 
-    if (argc >= 3) {
-        cpu1 = std::atoi(argv[1]);
-        cpu2 = std::atoi(argv[2]);
-    }
-    for (int i = 3; i < argc; ++i) {
-        if (!std::strcmp(argv[i], "--rt")) {
+    int positional = 0;
+    for (int i = 1; i < argc; ++i) {
+        const char* a = argv[i];
+        if (!std::strcmp(a, "--help") || !std::strcmp(a, "-h")) {
+            printUsage(argv[0]);
+            return 0;
+        }
+        if (!std::strcmp(a, "--rt")) {
             realtime = true;
-        } else if (!std::strcmp(argv[i], "--rtt-only")) {
+            continue;
+        }
+        if (!std::strcmp(a, "--rtt-only")) {
             rttOnly = true;
-        } else if (!std::strcmp(argv[i], "--depth-only")) {
+            continue;
+        }
+        if (!std::strcmp(a, "--depth-only")) {
             depthOnly = true;
-        } else if (!std::strncmp(argv[i], "--depth=", 8)) {
-            depthArg = std::atoll(argv[i] + 8);
+            continue;
+        }
+        if (!std::strncmp(a, "--depth=", 8)) {
+            depthArg = std::atoll(a + 8);
+            continue;
+        }
+        if (a[0] == '-' && !(a[1] >= '0' && a[1] <= '9')) {
+            std::fprintf(stderr, "unknown option: %s\n\n", a);
+            printUsage(argv[0]);
+            return 1;
+        }
+        if (positional == 0) {
+            cpu1 = std::atoi(a);
+            ++positional;
+        } else if (positional == 1) {
+            cpu2 = std::atoi(a);
+            ++positional;
+        } else {
+            std::fprintf(stderr, "unexpected argument: %s\n\n", a);
+            printUsage(argv[0]);
+            return 1;
         }
     }
 
@@ -977,8 +1049,15 @@ int main(int argc, char* argv[]) {
         }
 #endif
     }
-    std::printf("mode: cores=%d/%d  rt=%s  rtt-only=%s\n",
-                cpu1, cpu2, realtime ? "on" : "off", rttOnly ? "on" : "off");
+    char depthLabel[32];
+    if (depthArg < 0) {
+        std::snprintf(depthLabel, sizeof(depthLabel), "sweep");
+    } else {
+        std::snprintf(depthLabel, sizeof(depthLabel), "%lld", static_cast<long long>(depthArg));
+    }
+    std::printf("mode: cores=%d/%d  rt=%s  rtt-only=%s  depth-only=%s  depth=%s\n",
+                cpu1, cpu2, realtime ? "on" : "off", rttOnly ? "on" : "off",
+                depthOnly ? "on" : "off", depthLabel);
     calibrateTsc();
 
     // Full suite; --rtt-only / --depth-only skip straight to their tables.
