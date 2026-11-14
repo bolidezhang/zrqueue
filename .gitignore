@@ -1,0 +1,21 @@
+# CMake / Visual Studio generated files
+CMakeCache.txt
+CMakeFiles/
+cmake_install.cmake
+CTestTestfile.cmake
+Testing/
+*.vcxproj
+*.vcxproj.filters
+*.sln
+*.slnx
+*.dir/
+build/
+build*/
+out/
+.vs/
+
+# Compiled binaries and intermediates
+*.exe
+*.obj
+*.pdb
+*.ilk

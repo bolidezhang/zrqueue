@@ -24,6 +24,8 @@
 #include <thread>
 #include <vector>
 
+#include "tests/payloads.h"
+
 // ========== Cross-Platform Thread Pinning (CPU Affinity) ==========
 #if defined(_WIN32)
     #include <windows.h>
@@ -325,6 +327,92 @@ static void runRttSuite(int cpu1, int cpu2, const char* note) {
     sRing.report("RingBuffer", "ns RTT");
 }
 
+// ---------------------------------------------------------------------------
+// Payload throughput suite: non-POD / large-element paths that the int-only
+// main suite never touches. Small capacity keeps a 256-byte payload in MBs.
+// ---------------------------------------------------------------------------
+static constexpr int64_t  PAYLOAD_ITERS = 1000000;
+static constexpr int      PAYLOAD_REPS  = 3;
+static constexpr uint32_t PAYLOAD_CAP   = 4096;
+
+template <typename T>
+static void writePayload(T& v, uint64_t s) { v.seq = s; }
+static void writePayload(PayloadBig& v, uint64_t s) { v.fill(s); }
+
+template <typename T>
+static void runPayloadSuite(int cpu1, int cpu2, const char* label) {
+    std::printf("\n=== Payload throughput: %s, capacity %u, %lld iters x %d reps interleaved ===\n",
+                label, PAYLOAD_CAP, (long long)PAYLOAD_ITERS, PAYLOAD_REPS);
+    Stats sRig, sHeap, sInline, sMirror, sRing;
+
+    for (int rep = 0; rep < PAYLOAD_REPS; ++rep) {
+        {
+            rigtorp::SPSCQueue<T> q(PAYLOAD_CAP);
+            sRig.add(runThroughput(PAYLOAD_ITERS, cpu1, cpu2,
+                [&] { for (int64_t i = 0; i < PAYLOAD_ITERS; ++i)
+                          q.emplace(static_cast<uint64_t>(i)); },
+                [&] { for (int64_t i = 0; i < PAYLOAD_ITERS; ++i) {
+                          T* f;
+                          while ((f = q.front()) == nullptr) {}
+                          if (f->seq != static_cast<uint64_t>(i)) orderViolation("rigtorp payload");
+                          q.pop(); } }));
+        }
+        {
+            zrqueue::SpscHeapQueue<T> q(PAYLOAD_CAP);
+            sHeap.add(runThroughput(PAYLOAD_ITERS, cpu1, cpu2,
+                [&] { for (int64_t i = 0; i < PAYLOAD_ITERS; ++i)
+                          q.emplace(static_cast<uint64_t>(i)); },
+                [&] { for (int64_t i = 0; i < PAYLOAD_ITERS; ++i) {
+                          T* f;
+                          while ((f = q.front()) == nullptr) {}
+                          if (f->seq != static_cast<uint64_t>(i)) orderViolation("HeapQueue payload");
+                          q.pop(); } }));
+        }
+        {
+            auto* q = new zrqueue::SpscInlineQueue<T, PAYLOAD_CAP>();
+            sInline.add(runThroughput(PAYLOAD_ITERS, cpu1, cpu2,
+                [&] { for (int64_t i = 0; i < PAYLOAD_ITERS; ++i)
+                          q->emplace(static_cast<uint64_t>(i)); },
+                [&] { for (int64_t i = 0; i < PAYLOAD_ITERS; ++i) {
+                          T* f;
+                          while ((f = q->front()) == nullptr) {}
+                          if (f->seq != static_cast<uint64_t>(i)) orderViolation("InlineQueue payload");
+                          q->pop(); } }));
+            delete q;
+        }
+        {
+            auto* q = new zrqueue::SpscMirrorQueue<T, PAYLOAD_CAP>();
+            sMirror.add(runThroughput(PAYLOAD_ITERS, cpu1, cpu2,
+                [&] { for (int64_t i = 0; i < PAYLOAD_ITERS; ++i)
+                          q->emplace(static_cast<uint64_t>(i)); },
+                [&] { for (int64_t i = 0; i < PAYLOAD_ITERS; ++i) {
+                          T* f;
+                          while ((f = q->front()) == nullptr) {}
+                          if (f->seq != static_cast<uint64_t>(i)) orderViolation("MirrorQueue payload");
+                          q->pop(); } }));
+            delete q;
+        }
+        {
+            auto* q = new zrqueue::SpscRingBuffer<T, PAYLOAD_CAP>();
+            sRing.add(runThroughput(PAYLOAD_ITERS, cpu1, cpu2,
+                [&] { for (int64_t i = 0; i < PAYLOAD_ITERS; ++i)
+                          q->push([&](T* p) { writePayload(*p, static_cast<uint64_t>(i)); }); },
+                [&] { for (int64_t i = 0; i < PAYLOAD_ITERS; ++i) {
+                          T* f;
+                          while ((f = q->front()) == nullptr) {}
+                          if (f->seq != static_cast<uint64_t>(i)) orderViolation("RingBuffer payload");
+                          q->pop(); } }));
+            delete q;
+        }
+    }
+
+    sRig.report("rigtorp emplace/front/pop", "ops/ms");
+    sHeap.report("HeapQueue emplace/front/pop", "ops/ms");
+    sInline.report("InlineQueue emplace/front/pop", "ops/ms");
+    sMirror.report("MirrorQueue emplace/front/pop", "ops/ms");
+    sRing.report("RingBuffer alloc/write/push", "ops/ms");
+}
+
 int main(int argc, char* argv[]) {
     int cpu1 = -1; // consumer
     int cpu2 = -1; // producer
@@ -341,6 +429,10 @@ int main(int argc, char* argv[]) {
     // 16M: classic setup (what 10M normalizes to), queue never fills
     runThroughputSuite<16777216>(cpu1, cpu2, "classic methodology");
     runRttSuite<16777216>(cpu1, cpu2, "classic methodology");
+
+    // Non-POD and large-element payloads (small capacity, fewer iterations)
+    runPayloadSuite<PayloadBig>(cpu1, cpu2, "256B trivially-destructible");
+    runPayloadSuite<PayloadNonPod>(cpu1, cpu2, "non-trivial destructor");
 
     return 0;
 }

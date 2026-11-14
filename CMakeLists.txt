@@ -39,3 +39,11 @@ target_link_libraries(benchmark PRIVATE Threads::Threads)
 if(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
     target_link_options(benchmark PRIVATE -static-libstdc++ -static-libgcc)
 endif()
+
+# Correctness lives in its own target, independent of the benchmark.
+# zrqueue_tests.cpp undefines NDEBUG so claim/commit misuse assertions stay live.
+enable_testing()
+add_executable(zrqueue_tests tests/zrqueue_tests.cpp)
+target_include_directories(zrqueue_tests PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
+target_link_libraries(zrqueue_tests PRIVATE Threads::Threads)
+add_test(NAME zrqueue_tests COMMAND zrqueue_tests)
