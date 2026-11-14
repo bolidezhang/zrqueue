@@ -13,7 +13,7 @@ struct PayloadBig {
     uint64_t seq;
     std::array<unsigned char, kBytes - sizeof(uint64_t)> pad;
 
-    explicit PayloadBig(uint64_t s = 0) noexcept : seq(s), pad{} { fill(s); }
+    PayloadBig(uint64_t s = 0) noexcept : seq(s), pad{} { fill(s); }
 
     void fill(uint64_t s) noexcept {
         seq = s;
@@ -43,7 +43,7 @@ struct PayloadNonPod {
     uint64_t seq;
     static inline std::atomic<int> live{ 0 };
 
-    explicit PayloadNonPod(uint64_t s = 0) noexcept : seq(s) { live.fetch_add(1, std::memory_order_relaxed); }
+    PayloadNonPod(uint64_t s = 0) noexcept : seq(s) { live.fetch_add(1, std::memory_order_relaxed); }
     PayloadNonPod(const PayloadNonPod& o) noexcept : seq(o.seq) { live.fetch_add(1, std::memory_order_relaxed); }
     PayloadNonPod(PayloadNonPod&& o) noexcept : seq(o.seq) { live.fetch_add(1, std::memory_order_relaxed); }
     PayloadNonPod& operator=(const PayloadNonPod&) noexcept = default;
@@ -64,7 +64,7 @@ struct PayloadSized {
     uint32_t seq;
     std::array<unsigned char, N - sizeof(uint32_t)> pad;
 
-    explicit PayloadSized(uint64_t s = 0) noexcept : seq(static_cast<uint32_t>(s)), pad{} { fill(s); }
+    PayloadSized(uint64_t s = 0) noexcept : seq(static_cast<uint32_t>(s)), pad{} { fill(s); }
 
     void fill(uint64_t s) noexcept {
         seq = static_cast<uint32_t>(s);
@@ -79,6 +79,6 @@ struct PayloadSized {
 template <>
 struct PayloadSized<4> {
     uint32_t seq;
-    explicit PayloadSized(uint64_t s = 0) noexcept : seq(static_cast<uint32_t>(s)) {}
+    PayloadSized(uint64_t s = 0) noexcept : seq(static_cast<uint32_t>(s)) {}
     void fill(uint64_t s) noexcept { seq = static_cast<uint32_t>(s); }
 };
