@@ -28,7 +28,7 @@ SOFTWARE.
 
 #pragma once
 
-#define ZRQUEUE_VERSION 10800   //1.8.0
+#define ZRQUEUE_VERSION 10801   //1.8.1
 
 #include <atomic>
 #include <array>
@@ -633,7 +633,15 @@ namespace zrqueue {
         static_assert(N >= 2, "Capacity must be at least 2");
         static_assert((N & (N - 1)) == 0, "Capacity N must be a power of 2 for bitwise masking");
     public:
-        SpscInlineQueue() noexcept = default;
+        SpscInlineQueue() noexcept {
+            // A user-provided constructor removes value-init zeroing for `new Q()`
+            // and .BSS placement, so touch every page here instead of paying
+            // first-touch faults in the live phase (16M ints is ~16K faults).
+            volatile char* touch = reinterpret_cast<volatile char*>(slots_memory_);
+            for (size_t off = 0; off < static_cast<size_t>(N) * sizeof(T); off += 4096) {
+                touch[off] = 0;
+            }
+        }
         ~SpscInlineQueue() {
             while (front()) {
                 pop();
@@ -878,7 +886,7 @@ namespace zrqueue {
 
         // Busy-wait variant of alloc(): spins (with CPU pause) until a slot is free.
         // Producer-side counterpart of spin_front().
-        ZRQUEUE_NODISCARD T* spin_alloc() noexcept {
+        ZRQUEUE_NODISCARD ZRQUEUE_FORCE_INLINE T* spin_alloc() noexcept {
             const uint64_t write_index = write_index_.load(std::memory_order_relaxed);
             const uint64_t next_write_index = write_index + 1;
 
@@ -971,9 +979,20 @@ namespace zrqueue {
         }
 
         template<typename Writer>
-        void push(Writer&& writer) {
-            while (!try_push(std::forward<Writer>(writer))) {
-                ZRQUEUE_CPU_PAUSE();
+        ZRQUEUE_FORCE_INLINE void push(Writer&& writer) {
+            if constexpr (sizeof(T) > ZRQUEUE_CACHE_LINE_SIZE) {
+                // Multi-cache-line payloads: try_push's bool return and nullptr
+                // failure path force a stack frame, two register spills and two
+                // extra branches (MSVC /O2). Claiming directly avoids them;
+                // measured +26% at 128B. Small payloads keep the compact
+                // try_push loop, which wins there.
+                T* v = spin_alloc();
+                std::forward<Writer>(writer)(v);
+                push();
+            } else {
+                while (!try_push(std::forward<Writer>(writer))) {
+                    ZRQUEUE_CPU_PAUSE();
+                }
             }
         }
 

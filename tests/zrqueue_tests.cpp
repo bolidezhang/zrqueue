@@ -481,6 +481,23 @@ bool expectAbort(const char* self, const char* name) {
 #endif
 }
 
+void testRingPushLargePayload() {
+    // sizeof(T) > cache line takes the blocking spin_alloc branch of push(Writer).
+    zrqueue::SpscRingBuffer<PayloadBig, 8> q;
+    for (uint64_t i = 0; i < 6; ++i) {
+        q.push([&](PayloadBig* p) { p->fill(i); });
+    }
+    for (uint64_t i = 0; i < 6; ++i) {
+        PayloadBig* f = q.front();
+        CHECK(f != nullptr);
+        if (f) {
+            CHECK(f->check(i));
+        }
+        q.pop();
+    }
+    CHECK(q.empty());
+}
+
 void testDeathCases(const char* self) {
     static const char* cases[] = {
         "double_alloc", "double_spin_alloc", "bulk_then_push",
@@ -531,6 +548,7 @@ int main(int argc, char* argv[]) {
     testBulk();
     testNonPodLifetime();
     testClaimCommit();
+    testRingPushLargePayload();
     if (runDeath) {
         testDeathCases(argv[0]);
     }

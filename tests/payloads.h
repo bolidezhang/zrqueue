@@ -50,6 +50,35 @@ struct PayloadNonPod {
     PayloadNonPod& operator=(PayloadNonPod&&) noexcept = default;
     ~PayloadNonPod() { live.fetch_sub(1, std::memory_order_relaxed); }
 
+    void fill(uint64_t s) noexcept { seq = s; }
+
     static int alive() noexcept { return live.load(std::memory_order_relaxed); }
 };
 static_assert(!std::is_trivially_destructible_v<PayloadNonPod>, "PayloadNonPod must exercise destructor paths");
+
+// Fixed-size trivially-copyable payload for element-length sweeps.
+// uint32_t seq + byte padding yields sizeof == N for any N divisible by 4.
+template <std::size_t N>
+struct PayloadSized {
+    static_assert(N >= 4 && N % 4 == 0, "N must be a multiple of 4");
+    uint32_t seq;
+    std::array<unsigned char, N - sizeof(uint32_t)> pad;
+
+    explicit PayloadSized(uint64_t s = 0) noexcept : seq(static_cast<uint32_t>(s)), pad{} { fill(s); }
+
+    void fill(uint64_t s) noexcept {
+        seq = static_cast<uint32_t>(s);
+        for (std::size_t i = 0; i < pad.size(); ++i) {
+            pad[i] = static_cast<unsigned char>((s + i * 31u) & 0xFFu);
+        }
+    }
+};
+
+// std::array<T,0> is not zero-sized in MSVC, so the 4-byte case needs a
+// padding-free specialization to keep sizeof == 4.
+template <>
+struct PayloadSized<4> {
+    uint32_t seq;
+    explicit PayloadSized(uint64_t s = 0) noexcept : seq(static_cast<uint32_t>(s)) {}
+    void fill(uint64_t s) noexcept { seq = static_cast<uint32_t>(s); }
+};
