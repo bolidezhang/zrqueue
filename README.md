@@ -13,7 +13,7 @@ Designed strictly for High-Frequency Trading (HFT) and ultra-low latency (ULL) s
   * `SpscHeapQueue`: Dynamic capacity, heap-allocated, supports OS HugePages.
   * `SpscInlineQueue`: Zero-allocation, data is embedded directly within the object footprint via `std::byte` arrays, eliminating the final pointer-chasing penalty.
   * `SpscRingBuffer`: Disruptor-style claim/commit paradigm. Objects are pre-constructed and memory-pre-faulted, enabling absolute zero-copy modifications. Supports single-slot (`alloc`/`push`) and burst (`alloc_bulk`/`commit`) claims with exactly one release barrier per commit.
-  * `SpscMirrorQueue`: Latency-optimized for shallow-flow (near-empty) ping-pong. For `sizeof(T) <= 4`, the producer packs each element into an atomic `{seq | payload}` entry inside its **own index cache line**, so the consumer's polling load of `write_index_` fetches index *and* payload in **one** cross-core migration — halving the theoretical line migrations per round trip (4 → 2). Measured on a bare-metal Core Ultra 5 125H (cores 2/4 pinned): at 4 B it is the lowest-RTT model on all four percentiles (165 ns p50 / 431 ns p99.9 vs 204 / 456 for `rigtorp`) and the fastest at 466 K ops/ms. The advantage is strictly tied to the 4-byte mirror path — from 8 B upward the mirror is compiled out and all models converge to ~205 ns p50. On a quiet dedicated host the simpler Heap/Ring models can match it, since the saved migration is partly offset by pack/unpack work, and it remains the most placement-sensitive of the four models. **Usage caveat:** hold the pointer returned by `front()` — a second `front()` call takes the classic slot path and re-reads the slot line, silently voiding the piggyback (neutral for the other models).
+  * `SpscMirrorQueue`: Latency-optimized for shallow-flow (near-empty) ping-pong. For `sizeof(T) <= 4`, the producer packs each element into an atomic `{seq | payload}` entry inside its **own index cache line**, so the consumer's polling load of `write_index_` fetches index *and* payload in **one** cross-core migration — halving the theoretical line migrations per round trip (4 → 2). Measured on a bare-metal Core Ultra 5 125H (cores 2/4 pinned): at 4 B it is the lowest-RTT model on all four percentiles (165 ns p50 / 433 ns p99.9 vs 205 / 513 for `rigtorp`) and the fastest single-element model at 439 K ops/ms. From 8 B upward the mirror is compiled out and all models converge to ~205 ns p50 — a 64-bit mirror variant was built and measured **10x slower** than the classic path (see Findings), because the producer has to read the element back out of a slot line the consumer currently owns. **Usage caveat:** hold the pointer returned by `front()` — a second `front()` call takes the classic slot path and re-reads the slot line, silently voiding the piggyback (neutral for the other models).
 * **Zero Branch Misprediction:** Uses monotonically increasing `uint64_t` indices and bitwise AND (`& mask_`) instead of modulo or `if`-based wrap-around.
 * **Perfect Cache Line Isolation:** Every heavily-contended atomic variable strictly occupies its own dedicated 64-byte L1 Cache Line to utterly eradicate Cache Coherence Ping-Pong and Asymmetric False Sharing.
 * **Over-Aligned Payloads:** The default allocator aligns to `max(alignof(T), cache line)`, so `alignas(128)` message types get correctly aligned storage; a `static_assert` rejects any weaker alignment at compile time.
@@ -47,65 +47,74 @@ The bundled benchmark rotates the variant order on every repetition (cancel exec
 
 ### Measured results (bare-metal Windows host)
 
-**Conditions:** Intel Core Ultra 5 125H (14 cores / 18 threads, P+E), Windows 10.0.26300, MSVC 19.51 `/O2 /Ob2 /Oy- /GT /LTCG`, consumer pinned to core 2 and producer to core 4, `__rdtsc()` calibrated at 0.333868 ns/cycle (2.995 GHz). Throughput in K ops/ms, latency in ns, all medians over interleaved reps. **These are host-specific numbers — do not compare them with results from other machines, VMs, or compilers** (a 4-vCPU Ubuntu VM produced non-monotonic length sweeps and 2.2–2.4 µs p99.9 with the same code).
+**Conditions:** Intel Core Ultra 5 125H (14 cores / 18 threads, P+E), Windows 10.0.26300, MSVC 19.51 `/O2 /Ob2 /Oy- /GT /LTCG /DNDEBUG`, consumer pinned to core 2 and producer to core 4, `__rdtsc()` calibrated at 0.333868 ns/cycle (2.995 GHz). Throughput in K ops/ms, latency in ns, all medians over interleaved reps, two independent runs reported side by side. **These are host-specific numbers — do not compare them with results from other machines, VMs, or compilers** (a 4-vCPU Ubuntu VM produced non-monotonic length sweeps and 2.2–2.4 µs p99.9 with the same code).
 
-**Throughput by payload length, capacity 4096 (K ops/ms):**
+> **`/DNDEBUG` is not optional.** It must be defined in the measured build. `rigtorp::SPSCQueue::pop()` asserts with a cross-core acquire load; with assertions live that single load costs a full cache-line transfer per element and understated `rigtorp` by **7x** in an earlier run of this very benchmark (47 K vs 332 K ops/ms at `int`, 4096). MSVC's own Release configuration defines it, but assigning to `CMAKE_CXX_FLAGS_RELEASE` discards CMake's default — hence it is listed explicitly in `CMakeLists.txt`.
+
+**Throughput by payload length, capacity 4096 (K ops/ms, run 1 / run 2):**
 
 | bytes | `rigtorp` | `SpscHeapQueue` | `SpscInlineQueue` | `SpscMirrorQueue` | `SpscRingBuffer` |
 | :--- | ---: | ---: | ---: | ---: | ---: |
-| 4 | 170 | 376 | 359 | **466** | 488 |
-| 8 | 307 | 484 | **539** | 521 | 341 |
-| 16 | 140 | 142 | **180** | 156 | 129 |
-| 32 | **74** | 72 | 84 | 75 | 75 |
-| 64 | 37 | 40 | **47** | 42 | 42 |
-| 128 | 18 | 22 | **25** | 24 | 19 |
-| 256 | 5.5 | 5.6 | 5.4 | 5.5 | **5.9** |
-| 512 | 2.9 | 2.7 | 2.9 | **3.0** | 3.1 |
-| 1 KB | 1.4 | **1.5** | 1.5 | 1.5 | 1.4 |
-| non-POD | 30 | 29 | 31 | 31 | **435** |
+| 4 | 264 / 314 | 366 / 337 | 324 / 288 | **439 / 388** | 292 / 231 |
+| 8 | 284 / 277 | 457 / 459 | 484 / 437 | 483 / 429 | 343 / 330 |
+| 16 | 167 / 160 | 168 / 171 | 153 / 147 | 132 / 134 | 148 / 159 |
+| 32 | **82 / 78** | 75 / 79 | 77 / 77 | 67 / 70 | 74 / 75 |
+| 64 | 40 / 43 | 38 / 44 | 40 / 43 | 34 / 39 | **40 / 45** |
+| 128 | 20 / 21 | 22 / 22 | 22 / 24 | 22 / 21 | 17 / 18 |
+| 256 | 5.8 / 5.6 | 5.6 / 5.7 | 5.7 / 5.8 | 5.8 / 5.9 | **5.9 / 6.1** |
+| 512 | 2.9 / 3.0 | 3.1 / 3.2 | 2.9 / 3.0 | 3.0 / 2.8 | 3.0 / 3.0 |
+| 1 KB | 1.5 / 1.5 | 1.5 / 1.6 | 1.5 / 1.5 | 1.5 / 1.5 | 1.5 / 1.6 |
+| non-POD | 25 / 22 | 26 / 26 | 25 / 21 | 24 / 21 | **344 / 318** |
 
-**Throughput, `int` payload (K ops/ms):**
-
-| Variant | @4096 | @16M |
-| :--- | ---: | ---: |
-| `rigtorp` emplace/front/pop | 246 | 284 |
-| `SpscHeapQueue` emplace/front/pop | 523 | 539 |
-| `SpscInlineQueue` emplace/front/pop | 396 | 479 |
-| `SpscMirrorQueue` emplace/front/pop | **528** | **540** |
-| `SpscRingBuffer` alloc/write/push | 435 | 437 |
-| `SpscRingBuffer` alloc_bulk/commit ×64 | **1057** | **949** |
-| `SpscHeapQueue` push_bulk/consume_bulk ×64 | 723 | 663 |
-
-**Round-trip latency (ns):**
+**Throughput, `int` payload (K ops/ms, run 1 / run 2):**
 
 | Variant | @4096 | @16M |
 | :--- | ---: | ---: |
-| `rigtorp` | 207 | 367 |
-| `SpscHeapQueue` | 210 | 205 |
-| `SpscInlineQueue` | 205 | 204 |
-| `SpscMirrorQueue` | **161** | 233 |
-| `SpscRingBuffer` | 188 | 262 |
+| `rigtorp` emplace/front/pop | 185 / 92 | 492 / 513 |
+| `SpscHeapQueue` emplace/front/pop | 402 / 370 | 548 / 601 |
+| `SpscInlineQueue` emplace/front/pop | 384 / 357 | 557 / 599 |
+| `SpscMirrorQueue` emplace/front/pop | **454 / 436** | 557 / 572 |
+| `SpscRingBuffer` alloc/write/push | 456 / 455 | 365 / 405 |
+| `SpscRingBuffer` alloc_bulk/commit ×64 | **1028 / 971** | **935 / 1061** |
+| `SpscHeapQueue` push_bulk/consume_bulk ×64 | 616 / 615 | 629 / 636 |
 
-**RTT percentiles by payload length (ns, capacity 256):**
+**Round-trip latency (ns, run 1 / run 2):**
+
+| Variant | @4096 | @16M |
+| :--- | ---: | ---: |
+| `rigtorp` | 222 / 218 | 221 / 218 |
+| `SpscHeapQueue` | 216 / 221 | 217 / 222 |
+| `SpscInlineQueue` | 203 / 216 | 193 / 208 |
+| `SpscMirrorQueue` | **177 / 176** | **164 / 182** |
+| `SpscRingBuffer` | 196 / 223 | 217 / 232 |
+
+**RTT percentiles by payload length (ns, capacity 256, run 2):**
 
 | bytes | model | p50 | p90 | p99 | p99.9 |
 | :--- | :--- | ---: | ---: | ---: | ---: |
-| 4 | `rigtorp` | 204 | 223 | 252 | 456 |
-| 4 | `SpscHeapQueue` | 201 | 225 | 249 | 466 |
-| 4 | `SpscInlineQueue` | 202 | 222 | 293 | 479 |
-| 4 | **`SpscMirrorQueue`** | **165** | **184** | 271 | **431** |
-| 4 | `SpscRingBuffer` | 204 | 243 | 274 | 456 |
-| 256 | `SpscRingBuffer` | **361** | **398** | **408** | **518** |
-| 1 KB | `SpscRingBuffer` | **904** | **958** | 1127 | 5127 |
+| 4 | `rigtorp` | 205 | 209 | 272 | 513 |
+| 4 | `SpscHeapQueue` | 208 | 211 | 267 | 483 |
+| 4 | `SpscInlineQueue` | 204 | 208 | 243 | 448 |
+| 4 | **`SpscMirrorQueue`** | **165** | **166** | **187** | **433** |
+| 4 | `SpscRingBuffer` | 204 | 208 | 285 | 488 |
+| 8 | `rigtorp` | 203 | 206 | 269 | 496 |
+| 8 | `SpscMirrorQueue` | 211 | 213 | 277 | 498 |
+| 128 | `rigtorp` | 234 | 237 | 287 | 496 |
+| 256 | `SpscRingBuffer` | **401** | **407** | **466** | n/a |
+| 1 KB | `SpscInlineQueue` | **916** | **938** | 1213 | n/a |
+
+p99.9 is omitted from the ≥256 B rows because it is dominated by scheduler jitter on a general-purpose OS and swung 0.7–5.1 µs between the two runs (use `--rt` and core isolation to make it meaningful).
 
 **Findings:**
 
-* **Small elements (4–8 B) are where the design pays off.** `SpscMirrorQueue` reaches 466 K ops/ms at 4 B (2.7x `rigtorp`) and the lowest RTT of any model at 4 B on all four percentiles (165 ns p50, 31 % below `rigtorp`). From 8 B upward the mirror path is compiled out (`sizeof(T) <= 4`), and all five implementations collapse into a 204–212 ns p50 band.
-* **`SpscRingBuffer` `alloc_bulk`/`commit` is the throughput ceiling** — ~1 MB ops/ms at both capacities, roughly 2x the best single-element model, because one release barrier covers 64 elements.
-* **Non-POD elements reverse the ranking.** Every placement-new model (and `rigtorp`) drops to 29–31 K ops/ms because each element pays a constructor and destructor, while the pre-constructed `SpscRingBuffer` keeps 435 K — about **15x** the others.
-* **Beyond 32 B the queue is no longer the bottleneck.** All models sit within ±25 % of each other, and `throughput × length` flattens to ~1.2–1.3 GB/s from 256 B to 1 KB: the limit is cross-core cache-line transfer and memory bandwidth, not the queue protocol.
-* **Controlled-backlog sweep (4 B, 1 M iters):** at depth 0 (uncontrolled) zrqueue leads `rigtorp` by 2.3x; once the producer is throttled to depth ≥ 32 the gap closes to 1.15–1.3x. The large single-element advantage therefore comes from the unthrottled fast path, not from full-queue behaviour.
-* **No model wins every dimension.** Mirror wins 4 B latency and 4 B/8 B throughput; Ring wins bulk throughput, non-POD throughput, and ≥256 B latency; Heap is the most stable across placements and supports runtime capacity plus HugePages. Pick by element size, backlog shape, and whether the path is bulk or single-element.
+* **Only `sizeof(T) <= 4` gets the mirror fast path.** `SpscMirrorQueue` wins 4 B on every axis: 439 K ops/ms (1.7x `rigtorp`) and the lowest RTT at all four percentiles (165 ns p50, 20 % below `rigtorp`, p99 187 ns vs 272 ns). From 8 B upward the mirror is compiled out and all five models converge into a 203–223 ns p50 band.
+* **An 8 B mirror variant was implemented and rejected.** Piggybacking a 64-bit payload needs a 16 B entry (`{seq64 | payload64}` with a seqlock double-load, K = 2). It measured **54 K ops/ms at 8 B vs 513 K for the classic path — a 10x loss** on the same host. Cause: the producer must read the element back out of the slot it just constructed, and that line is currently owned by the consumer, so the read costs an extra cache-line transfer — exactly the migration the mirror was meant to save. Types whose constructor emits narrow stores (e.g. a byte-loop padding fill) also fail store-to-load forwarding: one 8 B store gave 197 K, two 4 B stores 48 K. The fast path is therefore deliberately limited to 4 B.
+* **`SpscRingBuffer` `alloc_bulk`/`commit` is the throughput ceiling** — ~1 M ops/ms at both capacities, roughly 2x the best single-element model, because one release barrier covers 64 elements.
+* **Non-POD elements reverse the ranking.** Every placement-new model (and `rigtorp`) drops to 21–26 K ops/ms because each element pays a constructor and destructor, while the pre-constructed `SpscRingBuffer` keeps 318–344 K — about **14x** the others.
+* **Beyond 32 B the queue is no longer the bottleneck.** All models sit within ±25 % of each other, and `throughput × length` flattens to ~1.5 GB/s from 256 B to 1 KB (5.8 K ops/ms × 256 B, 3.0 × 512 B, 1.5 × 1 KB): the limit is cross-core cache-line transfer and memory bandwidth, not the queue protocol.
+* **Controlled-backlog sweep (4 B, 1 M iters):** at depth 0 (uncontrolled) zrqueue leads `rigtorp` by 3.4–8.4x; once the producer is throttled to depth ≥ 32 the gap closes to 1.07–1.29x. The large single-element advantage therefore comes from the unthrottled fast path, not from full-queue behaviour.
+* **No model wins every dimension.** Mirror wins 4 B latency and 4 B throughput; Ring wins bulk throughput, non-POD throughput, and ≥256 B latency; Inline leads the 4 B controlled-backlog sweep at every depth ≥ 32; Heap is the most stable across placements and supports runtime capacity plus HugePages. Pick by element size, backlog shape, and whether the path is bulk or single-element.
+* **`rigtorp@4096` is the noisiest row** (92–185 K across runs while its own @16M row stays at ~500 K). It spins without `pause` and holds no cached index, so a 4 K ring puts it in the full-queue slow path most of the time; treat that cell as "slow path stress", not a stable throughput figure.
 * **`size()`/`empty()` are observability only.** They issue two `relaxed` loads and are not a snapshot; the subtraction is clamped, but they must never drive flow control.
 
 **Methodology note:** on a shared or virtualized host the hypervisor can co-locate both vCPUs on SMT siblings of one physical core, producing 40–106 ns "cross-core" round trips that are physically impossible. Such runs were discarded; the table above is from a bare-metal host with distinct cores pinned. Tail percentiles on a general-purpose OS measure scheduler jitter — run `benchmark 2 4 --rtt-only --rt` (high priority) and, on Linux, `isolcpus`/`nohz_full` for publishable p99.9.
@@ -227,10 +236,12 @@ if (zrqueue::hugepage_fallback_occurred()) {
 ## Build Instructions
 As a single-header library, `zrqueue` requires no complex build systems or external dependencies. Simply drop `zrqueue.h` into your source tree and include it.
 
-* **C++ Standard:** Requires **C++17** or later (uses `if constexpr`, `std::byte`, etc.).
+* **C++ Standard:** Requires **C++17** or later (uses `if constexpr`, `std::byte`, etc.). Enforced at compile time: the header `#error`s on an older standard, checking `_MSVC_LANG` because MSVC reports `__cplusplus` as `199711L`.
 * **Compilers:** GCC, Clang, or MSVC.
 * **OS:** Linux, macOS, or Windows.
 * **Architecture:** x86_64, aarch64.
+
+On Windows the header defines `WIN32_LEAN_AND_MEAN` and `NOMINMAX` before including `<windows.h>`, so it never leaks `min`/`max` macros into the including translation unit.
 
 To compile the benchmark tool, use the provided `CMakeLists.txt`:
 ```bash
@@ -241,7 +252,7 @@ cmake --build . --config Release
 # Run benchmark with Thread Affinity (Producer on Core 2, Consumer on Core 4)
 ./benchmark 2 4
 ```
-*Note: The CMake configuration automatically applies `-O3`, `-march=native`, `-flto`, and `-fomit-frame-pointer` for maximum performance.*
+*Note: optimisation flags are per-configuration (`CMAKE_CXX_FLAGS_RELEASE` and friends), not global, so a Debug build keeps its assertions and stays debuggable. GCC/Clang Release gets `-O3 -DNDEBUG -march=native -flto=auto -fomit-frame-pointer`; MSVC Release gets `/O2 /Ob2 /GL /DNDEBUG` plus `/LTCG`. **`NDEBUG` is required for meaningful numbers** — without it `rigtorp`'s own `pop()` assertion costs a cross-core load per element and makes the comparison meaningless.*
 
 ## License
 MIT License. Copyright (c) 2024 Bolide Zhang.

@@ -1,1 +1,9 @@
 * text=auto eol=lf
+
+# Source files must stay BOM-free and ASCII-only where possible: a UTF-8 BOM in a
+# header is concatenated into every including translation unit, and GCC rejects a
+# BOM that is not at the very start of a TU. Keeping these files plain also lets
+# MSVC parse them regardless of the system code page.
+*.h    text eol=lf -working-tree-encoding
+*.cpp  text eol=lf -working-tree-encoding
+*.txt  text eol=lf

@@ -1,4 +1,4 @@
-﻿/*
+/*
 Copyright (c) 2024 Bolide Zhang <bolidezhang@gmail.com>
 
 Permission is hereby granted, free of charge, to any person obtaining a copy
@@ -49,7 +49,7 @@ SOFTWARE.
     #error "zrqueue requires if constexpr (__cpp_if_constexpr missing)"
 #endif
 
-#define ZRQUEUE_VERSION 10901   //1.9.1
+#define ZRQUEUE_VERSION 10902   //1.9.2
 
 #include <atomic>
 #include <array>
@@ -69,6 +69,17 @@ SOFTWARE.
 // ============================================================================
 #if defined(_MSC_VER) || defined(__MINGW32__)
     #define ZRQUEUE_OS_WINDOWS 1
+    // This is a public single-header library, so the Windows headers must not leak
+    // into the including translation unit: WIN32_LEAN_AND_MEAN drops the rarely
+    // used subsystems, and NOMINMAX keeps the min/max function-like macros from
+    // breaking std::min/std::max in user code. Both stay defined afterwards, which
+    // is the safer default for later <windows.h> includes in the same TU.
+    #ifndef WIN32_LEAN_AND_MEAN
+        #define WIN32_LEAN_AND_MEAN
+    #endif
+    #ifndef NOMINMAX
+        #define NOMINMAX
+    #endif
     #include <windows.h>
     #include <memoryapi.h>
     #include <malloc.h>
@@ -665,14 +676,17 @@ namespace zrqueue {
             const uint64_t next_read_index = read_index + count_to_consume;
 
             // 2. Sequentially process data and destruct in-place
+            // The handler is invoked through std::forward on every iteration: the
+            // parameter is a named variable (lvalue), so calling it directly would
+            // reject rvalue-qualified operator() overloads. The forward is a
+            // compile-time cast and emits no code, so repeating it is free.
             for (size_t i = 0; i < count_to_consume; ++i) {
-                size_t current_offset = (read_index + i) & mask_;
-                // Pass data reference directly to user's lambda for processing (Zero data copy)
-                std::forward<THandler>(handler)(slots_[current_offset]);
+                T& elem = slots_[(read_index + i) & mask_];
+                std::forward<THandler>(handler)(elem); // zero-copy: reference, not a copy
 
                 if constexpr (!std::is_trivially_destructible_v<T>) {
                     // Manually destruct after processing
-                    slots_[current_offset].~T();
+                    elem.~T();
                 }
             }
 
@@ -963,12 +977,15 @@ namespace zrqueue {
             const uint64_t next_read_index = read_index + count_to_consume;
 
             T* raw_array = reinterpret_cast<T*>(slots_memory_);
+            // std::forward on every iteration is a compile-time cast that emits no
+            // code; it is what keeps rvalue-qualified operator() overloads callable
+            // (the parameter itself is a named lvalue).
             for (size_t i = 0; i < count_to_consume; ++i) {
-                size_t current_offset = (read_index + i) & MASK;
-                std::forward<THandler>(handler)(raw_array[current_offset]);
+                T& elem = raw_array[(read_index + i) & MASK];
+                std::forward<THandler>(handler)(elem); // zero-copy: reference, not a copy
 
                 if constexpr (!std::is_trivially_destructible_v<T>) {
-                    raw_array[current_offset].~T();
+                    elem.~T();
                 }
             }
 
@@ -1298,8 +1315,13 @@ namespace zrqueue {
             const size_t available = static_cast<size_t>(cached_write_index_ - read_index);
             const size_t count_to_consume = (max_count == 0 || max_count > available) ? available : max_count;
 
+            // std::forward on every iteration is a compile-time cast that emits no
+            // code; it is what keeps rvalue-qualified operator() overloads callable
+            // (the parameter itself is a named lvalue). Elements are pre-constructed
+            // and never destructed here, so the handler must leave the slot reusable.
             for (size_t i = 0; i < count_to_consume; ++i) {
-                std::forward<THandler>(handler)(data_[(read_index + i) & MASK]);
+                T& elem = data_[(read_index + i) & MASK];
+                std::forward<THandler>(handler)(elem); // zero-copy: reference, not a copy
             }
 
             read_index_.store(read_index + count_to_consume, std::memory_order_release);
