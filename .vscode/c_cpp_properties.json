@@ -1,0 +1,16 @@
+{
+    "version": 4,
+    "configurations": [
+        {
+            "name": "Win32 (MSVC)",
+            "includePath": [
+                "${workspaceFolder}",
+                "${workspaceFolder}/third_party/rigtorp/include"
+            ],
+            "cStandard": "c17",
+            "cppStandard": "c++17",
+            "intelliSenseMode": "windows-msvc-x64",
+            "configurationProvider": "ms-vscode.cmake-tools"
+        }
+    ]
+}

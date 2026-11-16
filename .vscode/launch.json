@@ -1,0 +1,66 @@
+{
+    "version": "0.2.0",
+    "configurations": [
+        {
+            "name": "Debug: zrqueue_tests",
+            "type": "cppvsdbg",
+            "request": "launch",
+            "program": "${workspaceFolder}/build/Debug/zrqueue_tests.exe",
+            "args": [],
+            "cwd": "${workspaceFolder}",
+            "console": "integratedTerminal",
+            "stopAtEntry": false,
+            "preLaunchTask": "cmake: build (Debug)"
+        },
+        {
+            "name": "Debug: zrqueue_tests (skip death tests)",
+            "type": "cppvsdbg",
+            "request": "launch",
+            "program": "${workspaceFolder}/build/Debug/zrqueue_tests.exe",
+            "args": ["--no-death"],
+            "cwd": "${workspaceFolder}",
+            "console": "integratedTerminal",
+            "stopAtEntry": false,
+            "preLaunchTask": "cmake: build (Debug)"
+        },
+        {
+            "name": "Run: benchmark (unpinned)",
+            "type": "cppvsdbg",
+            "request": "launch",
+            "program": "${workspaceFolder}/build/Release/benchmark.exe",
+            "args": [],
+            "cwd": "${workspaceFolder}",
+            "console": "integratedTerminal",
+            "stopAtEntry": false,
+            "preLaunchTask": "cmake: build (Release)"
+        },
+        {
+            "name": "Run: benchmark (cores 2/4)",
+            "type": "cppvsdbg",
+            "request": "launch",
+            "program": "${workspaceFolder}/build/Release/benchmark.exe",
+            "args": ["2", "4"],
+            "cwd": "${workspaceFolder}",
+            "console": "integratedTerminal",
+            "stopAtEntry": false,
+            "preLaunchTask": "cmake: build (Release)"
+        },
+        {
+            "name": "Run: benchmark (RTT percentiles, rt)",
+            "type": "cppvsdbg",
+            "request": "launch",
+            "program": "${workspaceFolder}/build/Release/benchmark.exe",
+            "args": ["2", "4", "--rtt-only", "--rt"],
+            "cwd": "${workspaceFolder}",
+            "console": "integratedTerminal",
+            "stopAtEntry": false,
+            "preLaunchTask": "cmake: build (Release)"
+        },
+        {
+            "name": "Attach to benchmark.exe",
+            "type": "cppvsdbg",
+            "request": "attach",
+            "processId": "${command:pickProcess}"
+        }
+    ]
+}
