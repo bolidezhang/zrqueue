@@ -360,7 +360,7 @@ void testFrontBulkLifetime() {
 struct alignas(128) AlignedMsg {
     uint64_t seq;
     uint64_t pad[15];
-    explicit AlignedMsg(uint64_t s = 0) noexcept : seq(s), pad{} {}
+    AlignedMsg(uint64_t s = 0) noexcept : seq(s), pad{} {}
 };
 static_assert(alignof(AlignedMsg) == 128, "probe payload must require 128-byte alignment");
 static_assert(sizeof(AlignedMsg) == 128, "probe payload must be exactly 128 bytes");
