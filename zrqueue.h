@@ -28,7 +28,28 @@ SOFTWARE.
 
 #pragma once
 
-#define ZRQUEUE_VERSION 10801   //1.8.1
+// ============================================================================
+// [Language Standard Gate: C++17 or later is mandatory]
+// The library relies on if constexpr, std::byte, inline variables,
+// std::hardware_destructive_interference_size (when available) and
+// std::is_nothrow_invocable. MSVC reports __cplusplus as 199711L unless
+// /Zc:__cplusplus is passed, so use _MSVC_LANG there.
+// ============================================================================
+#if defined(_MSVC_LANG)
+    #define ZRQUEUE_CPLUSPLUS _MSVC_LANG
+#else
+    #define ZRQUEUE_CPLUSPLUS __cplusplus
+#endif
+
+#if ZRQUEUE_CPLUSPLUS < 201703L
+    #error "zrqueue requires C++17 or later (use /std:c++17 or -std=c++17)"
+#endif
+
+#if !defined(__cpp_if_constexpr)
+    #error "zrqueue requires if constexpr (__cpp_if_constexpr missing)"
+#endif
+
+#define ZRQUEUE_VERSION 10900   //1.9.0
 
 #include <atomic>
 #include <array>
@@ -85,16 +106,27 @@ SOFTWARE.
 #endif
 
 // ============================================================================
-// [Compiler Macros and Microarchitecture Attributes]
+// [Branch Hints]
+// There is no branch-hint facility in C++17: [[likely]]/[[unlikely]] arrived in
+// C++20 and are STATEMENT attributes, so they cannot be embedded in a
+// boolean-expression macro like the ones below (all ~70 call sites are
+// `if (ZRQUEUE_UNLIKELY(expr))` / `while (...)`). __builtin_expect is the only
+// usable expression form and is accepted by GCC and Clang in every mode.
+// MSVC 19.5x has neither (verified: `error C3861: __builtin_expect`), so it
+// degrades to the plain expression - correct, just unhinted.
 // ============================================================================
 #if defined(__GNUC__) || defined(__clang__)
-    // GCC and Clang (Including Clang-CL on Windows)
     #define ZRQUEUE_LIKELY(x)    __builtin_expect(!!(x), 1)
     #define ZRQUEUE_UNLIKELY(x)  __builtin_expect(!!(x), 0)
-    #define ZRQUEUE_FORCE_INLINE inline __attribute__((always_inline))
 #else
     #define ZRQUEUE_LIKELY(x)    (x)
     #define ZRQUEUE_UNLIKELY(x)  (x)
+#endif
+
+#if defined(__GNUC__) || defined(__clang__)
+    // GCC and Clang (Including Clang-CL on Windows)
+    #define ZRQUEUE_FORCE_INLINE inline __attribute__((always_inline))
+#else
     #if defined(_MSC_VER)
         #define ZRQUEUE_FORCE_INLINE __forceinline
     #else
@@ -137,24 +169,25 @@ namespace zrqueue {
     // Note: requests above 2^30 elements are silently clamped to 2^30.
     inline constexpr uint32_t normalize_size(uint32_t n) noexcept {
         constexpr uint32_t MIN_SIZE = 2;
-        constexpr uint32_t MAX_POW2 = 1u << 30;
-        if (n < MIN_SIZE) {
-            n = MIN_SIZE;
+        constexpr uint32_t MAX_SIZE = 1u << 30;
+
+        if (n <= MIN_SIZE) {
+            return MIN_SIZE;
         }
-        n--;
+
+        if (n >= MAX_SIZE) {
+            return MAX_SIZE;
+        }
+
+        --n;
+
         n |= n >> 1;
         n |= n >> 2;
         n |= n >> 4;
         n |= n >> 8;
         n |= n >> 16;
-        n++;
-        if (n == 0) {
-            return MIN_SIZE;
-        }
-        if (n > MAX_POW2) {
-            return MAX_POW2;
-        }
-        return n;
+
+        return n + 1;
     }
 
     // Round up to the specified boundary (Boundary must be a power of 2)
@@ -217,9 +250,16 @@ namespace zrqueue {
 
     /**
      * @brief Strictly aligned allocator: Completely eliminates false sharing at head and tail
+     * Default alignment covers over-aligned element types (e.g. alignas(128) messages):
+     * a fixed 64-byte alignment would under-align alignof(T) > 64 types.
      */
-    template <typename T, size_t Alignment = ZRQUEUE_CACHE_LINE_SIZE>
+    template <typename T, size_t Alignment = (alignof(T) > ZRQUEUE_CACHE_LINE_SIZE
+                                                 ? alignof(T) : ZRQUEUE_CACHE_LINE_SIZE)>
     struct AlignedAllocator {
+        static_assert(Alignment >= alignof(T),
+                      "AlignedAllocator: Alignment must be at least alignof(T)");
+        static_assert((Alignment & (Alignment - 1)) == 0,
+                      "AlignedAllocator: Alignment must be a power of 2");
         using value_type = T;
         template <class U> struct rebind {
             using other = AlignedAllocator<U, Alignment>;
@@ -352,7 +392,7 @@ namespace zrqueue {
     // ============================================================================
     // [Ultra-Fast Lock-Free SpscHeapQueue]
     // ============================================================================
-    template <typename T, typename Allocator = AlignedAllocator<T, ZRQUEUE_CACHE_LINE_SIZE>>
+    template <typename T, typename Allocator = AlignedAllocator<T>>
     class SpscHeapQueue {
     public:
         explicit SpscHeapQueue(const uint32_t capacity, const Allocator& allocator = Allocator())
@@ -374,8 +414,14 @@ namespace zrqueue {
         }
 
         ~SpscHeapQueue() {
-            while (front()) {
-                pop();
+            // Destruction implies quiescence, so destroy the live range directly
+            // instead of driving the front()/pop() protocol (N atomic stores).
+            if constexpr (!std::is_trivially_destructible_v<T>) {
+                const uint64_t head = read_index_.load(std::memory_order_relaxed);
+                const uint64_t tail = write_index_.load(std::memory_order_relaxed);
+                for (uint64_t i = head; i < tail; ++i) {
+                    slots_[i & mask_].~T();
+                }
             }
             std::allocator_traits<Allocator>::deallocate(allocator_, slots_, capacity_);
         }
@@ -488,20 +534,71 @@ namespace zrqueue {
             read_index_.store(next_read_index, std::memory_order_release);
         }
 
-        // Allow peeking at elements 'offset' positions ahead of read cursor without moving it
+        // Allow peeking at elements 'offset' positions ahead of read cursor without moving it.
+        // The bound is checked in the subtraction domain: read_index + offset can wrap for a
+        // huge offset (peek(-1) converts to SIZE_MAX) and would then slip past the check.
         ZRQUEUE_NODISCARD ZRQUEUE_FORCE_INLINE T* peek(size_t offset = 0) noexcept {
             const uint64_t read_index = read_index_.load(std::memory_order_relaxed);
-            const uint64_t new_read_index = read_index + offset;
+            const uint64_t off = static_cast<uint64_t>(offset);
 
-            // Ensure adding offset does not cross the producer's write position
-            if (ZRQUEUE_UNLIKELY(new_read_index >= cached_write_index_)) {
+            // Ensure offset does not cross the producer's write position
+            if (ZRQUEUE_UNLIKELY(off >= cached_write_index_ - read_index)) {
                 cached_write_index_ = write_index_.load(std::memory_order_acquire);
-                if (ZRQUEUE_UNLIKELY(new_read_index >= cached_write_index_)) {
+                if (ZRQUEUE_UNLIKELY(off >= cached_write_index_ - read_index)) {
                     return nullptr;
                 }
             }
 
-            return &slots_[new_read_index & mask_];
+            return &slots_[(read_index + off) & mask_];
+        }
+
+        // ------------------------------------------------------------------------
+        // Bulk Zero-Copy Read (front_bulk / pop_bulk)
+        // Consumer claims up to `want` contiguous elements starting at the read
+        // cursor, without copying. The run never straddles the wrap point; call
+        // again after pop_bulk() to take the remainder. Pair every successful
+        // front_bulk() with pop_bulk(n), n <= available.
+        // ------------------------------------------------------------------------
+        ZRQUEUE_NODISCARD ZRQUEUE_FORCE_INLINE T* front_bulk(size_t want, size_t& available) noexcept {
+            available = 0;
+            if (ZRQUEUE_UNLIKELY(want == 0)) {
+                return nullptr;
+            }
+            const uint64_t read_index = read_index_.load(std::memory_order_relaxed);
+            if (ZRQUEUE_UNLIKELY(read_index == cached_write_index_)) {
+                cached_write_index_ = write_index_.load(std::memory_order_acquire);
+                if (ZRQUEUE_UNLIKELY(read_index == cached_write_index_)) {
+                    return nullptr;
+                }
+            }
+            size_t count = static_cast<size_t>(cached_write_index_ - read_index);
+            if (count > want) {
+                count = want;
+            }
+            const size_t offset = static_cast<size_t>(read_index & mask_);
+            const size_t till_wrap = capacity_ - offset;
+            if (count > till_wrap) {
+                count = till_wrap;
+            }
+            available = count;
+            return &slots_[offset];
+        }
+
+        ZRQUEUE_FORCE_INLINE void pop_bulk(size_t n) noexcept {
+            static_assert(std::is_nothrow_destructible_v<T>, "T must be nothrow destructible");
+            if (ZRQUEUE_UNLIKELY(n == 0)) {
+                return;
+            }
+            const uint64_t read_index = read_index_.load(std::memory_order_relaxed);
+#ifndef NDEBUG
+            assert(n <= cached_write_index_ - read_index && "pop_bulk(n) exceeds the published backlog");
+#endif
+            if constexpr (!std::is_trivially_destructible_v<T>) {
+                for (size_t i = 0; i < n; ++i) {
+                    slots_[(read_index + i) & mask_].~T();
+                }
+            }
+            read_index_.store(read_index + n, std::memory_order_release);
         }
 
         // ------------------------------------------------------------------------
@@ -511,6 +608,8 @@ namespace zrqueue {
         // ------------------------------------------------------------------------
         template <typename Iterator>
         ZRQUEUE_NODISCARD size_t push_bulk(Iterator first, size_t count) noexcept {
+            static_assert(std::is_nothrow_constructible_v<T, decltype(*first)>,
+                          "push_bulk is noexcept: T must be nothrow-constructible from the iterator's value");
             if (ZRQUEUE_UNLIKELY(count == 0)) {
                 return 0;
             }
@@ -549,6 +648,8 @@ namespace zrqueue {
         template <typename THandler>
         ZRQUEUE_NODISCARD size_t consume_bulk(THandler&& handler, size_t max_count = 0) noexcept {
             static_assert(std::is_nothrow_destructible_v<T>, "T must be nothrow destructible");
+            static_assert(std::is_nothrow_invocable_v<THandler, T&>,
+                          "consume_bulk is noexcept: handler must be nothrow-invocable with T&");
             const uint64_t read_index = read_index_.load(std::memory_order_relaxed);
 
             // 1. Get current number of backlogged elements
@@ -580,14 +681,22 @@ namespace zrqueue {
             return count_to_consume; // Return actual consumed count
         }
 
+        // Observability only: reads two indices independently, so the result is a
+        // stale, non-atomic snapshot. Never gate flow control on it - use
+        // try_push/try_emplace/try_pop, which decide on the producer/consumer side.
         ZRQUEUE_NODISCARD ZRQUEUE_FORCE_INLINE size_t size() const noexcept {
-            uint64_t w = write_index_.load(std::memory_order_acquire);
-            uint64_t r = read_index_.load(std::memory_order_acquire);
+            uint64_t w = write_index_.load(std::memory_order_relaxed);
+            uint64_t r = read_index_.load(std::memory_order_relaxed);
+            // Two independent loads, not a snapshot: r may be observed ahead of w
+            // (consumer drained past the w we read), so guard the subtraction.
             return (w >= r) ? static_cast<size_t>(w - r) : 0;
         }
 
+        // Observability only; same snapshot caveat as size().
         ZRQUEUE_NODISCARD ZRQUEUE_FORCE_INLINE bool empty() const noexcept {
-            return write_index_.load(std::memory_order_acquire) == read_index_.load(std::memory_order_acquire);
+            uint64_t w = write_index_.load(std::memory_order_relaxed);
+            uint64_t r = read_index_.load(std::memory_order_relaxed);
+            return w == r;
         }
 
         ZRQUEUE_NODISCARD ZRQUEUE_FORCE_INLINE size_t capacity() const noexcept {
@@ -617,7 +726,7 @@ namespace zrqueue {
     };  // end SpscHeapQueue
 
     // Backward-compatible alias for the pre-1.6.0 name. New code should use SpscHeapQueue.
-    template <typename T, typename Allocator = AlignedAllocator<T, ZRQUEUE_CACHE_LINE_SIZE>>
+    template <typename T, typename Allocator = AlignedAllocator<T>>
     using SpscQueue [[deprecated("Renamed to SpscHeapQueue")]] = SpscHeapQueue<T, Allocator>;
 
     /**
@@ -643,8 +752,14 @@ namespace zrqueue {
             }
         }
         ~SpscInlineQueue() {
-            while (front()) {
-                pop();
+            // Destruction implies quiescence: walk the live range directly.
+            if constexpr (!std::is_trivially_destructible_v<T>) {
+                const uint64_t head = read_index_.load(std::memory_order_relaxed);
+                const uint64_t tail = write_index_.load(std::memory_order_relaxed);
+                T* raw_array = reinterpret_cast<T*>(slots_memory_);
+                for (uint64_t i = head; i < tail; ++i) {
+                    raw_array[i & MASK].~T();
+                }
             }
         }
 
@@ -709,6 +824,8 @@ namespace zrqueue {
 
         template <typename Iterator>
         ZRQUEUE_NODISCARD size_t push_bulk(Iterator first, size_t count) noexcept {
+            static_assert(std::is_nothrow_constructible_v<T, decltype(*first)>,
+                          "push_bulk is noexcept: T must be nothrow-constructible from the iterator's value");
             if (ZRQUEUE_UNLIKELY(count == 0)) {
                 return 0;
             }
@@ -774,15 +891,59 @@ namespace zrqueue {
 
         ZRQUEUE_NODISCARD ZRQUEUE_FORCE_INLINE T* peek(size_t offset = 0) noexcept {
             const uint64_t read_index = read_index_.load(std::memory_order_relaxed);
-            const uint64_t new_read_index = read_index + offset;
-            if (ZRQUEUE_UNLIKELY(new_read_index >= cached_write_index_)) {
+            const uint64_t off = static_cast<uint64_t>(offset);
+            if (ZRQUEUE_UNLIKELY(off >= cached_write_index_ - read_index)) {
                 cached_write_index_ = write_index_.load(std::memory_order_acquire);
-                if (ZRQUEUE_UNLIKELY(new_read_index >= cached_write_index_)) {
+                if (ZRQUEUE_UNLIKELY(off >= cached_write_index_ - read_index)) {
                     return nullptr;
                 }
             }
 
-            return &reinterpret_cast<T*>(slots_memory_)[new_read_index & MASK];
+            return &reinterpret_cast<T*>(slots_memory_)[(read_index + off) & MASK];
+        }
+
+        // Bulk Zero-Copy Read: same contract as SpscHeapQueue::front_bulk/pop_bulk.
+        ZRQUEUE_NODISCARD ZRQUEUE_FORCE_INLINE T* front_bulk(size_t want, size_t& available) noexcept {
+            available = 0;
+            if (ZRQUEUE_UNLIKELY(want == 0)) {
+                return nullptr;
+            }
+            const uint64_t read_index = read_index_.load(std::memory_order_relaxed);
+            if (ZRQUEUE_UNLIKELY(read_index == cached_write_index_)) {
+                cached_write_index_ = write_index_.load(std::memory_order_acquire);
+                if (ZRQUEUE_UNLIKELY(read_index == cached_write_index_)) {
+                    return nullptr;
+                }
+            }
+            size_t count = static_cast<size_t>(cached_write_index_ - read_index);
+            if (count > want) {
+                count = want;
+            }
+            const size_t offset = static_cast<size_t>(read_index & MASK);
+            const size_t till_wrap = N - offset;
+            if (count > till_wrap) {
+                count = till_wrap;
+            }
+            available = count;
+            return &reinterpret_cast<T*>(slots_memory_)[offset];
+        }
+
+        ZRQUEUE_FORCE_INLINE void pop_bulk(size_t n) noexcept {
+            static_assert(std::is_nothrow_destructible_v<T>, "T must be nothrow destructible");
+            if (ZRQUEUE_UNLIKELY(n == 0)) {
+                return;
+            }
+            const uint64_t read_index = read_index_.load(std::memory_order_relaxed);
+#ifndef NDEBUG
+            assert(n <= cached_write_index_ - read_index && "pop_bulk(n) exceeds the published backlog");
+#endif
+            if constexpr (!std::is_trivially_destructible_v<T>) {
+                T* raw_array = reinterpret_cast<T*>(slots_memory_);
+                for (size_t i = 0; i < n; ++i) {
+                    raw_array[(read_index + i) & MASK].~T();
+                }
+            }
+            read_index_.store(read_index + n, std::memory_order_release);
         }
 
         template <typename THandler>
@@ -815,14 +976,22 @@ namespace zrqueue {
             return count_to_consume;
         }
 
+        // Observability only: reads two indices independently, so the result is a
+        // stale, non-atomic snapshot. Never gate flow control on it - use
+        // try_push/try_emplace/try_pop, which decide on the producer/consumer side.
         ZRQUEUE_NODISCARD ZRQUEUE_FORCE_INLINE size_t size() const noexcept {
-            uint64_t w = write_index_.load(std::memory_order_acquire);
-            uint64_t r = read_index_.load(std::memory_order_acquire);
+            uint64_t w = write_index_.load(std::memory_order_relaxed);
+            uint64_t r = read_index_.load(std::memory_order_relaxed);
+            // Two independent loads, not a snapshot: r may be observed ahead of w
+            // (consumer drained past the w we read), so guard the subtraction.
             return (w >= r) ? static_cast<size_t>(w - r) : 0;
         }
 
+        // Observability only; same snapshot caveat as size().
         ZRQUEUE_NODISCARD ZRQUEUE_FORCE_INLINE bool empty() const noexcept {
-            return write_index_.load(std::memory_order_acquire) == read_index_.load(std::memory_order_acquire);
+            uint64_t w = write_index_.load(std::memory_order_relaxed);
+            uint64_t r = read_index_.load(std::memory_order_relaxed);
+            return w == r;
         }
 
         ZRQUEUE_NODISCARD ZRQUEUE_FORCE_INLINE constexpr size_t capacity() const noexcept {
@@ -855,8 +1024,8 @@ namespace zrqueue {
         static_assert(N >= 2, "Capacity must be at least 2");
         static_assert((N & (N - 1)) == 0, "N must be a power of 2");
     public:
-        SpscRingBuffer() noexcept = default;
-        ~SpscRingBuffer() noexcept = default;
+        SpscRingBuffer() = default;
+        ~SpscRingBuffer() = default;
 
         // non-copyable and non-movable
         SpscRingBuffer(const SpscRingBuffer&) = delete;
@@ -1031,16 +1200,54 @@ namespace zrqueue {
 
         ZRQUEUE_NODISCARD ZRQUEUE_FORCE_INLINE T* peek(size_t offset = 0) noexcept {
             const uint64_t read_index = read_index_.load(std::memory_order_relaxed);
-            const uint64_t new_read_index = read_index + offset;
+            const uint64_t off = static_cast<uint64_t>(offset);
 
-            if (ZRQUEUE_UNLIKELY(new_read_index >= cached_write_index_)) {
+            if (ZRQUEUE_UNLIKELY(off >= cached_write_index_ - read_index)) {
                 cached_write_index_ = write_index_.load(std::memory_order_acquire);
-                if (ZRQUEUE_UNLIKELY(new_read_index >= cached_write_index_)) {
+                if (ZRQUEUE_UNLIKELY(off >= cached_write_index_ - read_index)) {
                     return nullptr;
                 }
             }
 
-            return &data_[new_read_index & MASK];
+            return &data_[(read_index + off) & MASK];
+        }
+
+        // Bulk Zero-Copy Read: elements are pre-constructed, so pop_bulk() only
+        // advances the cursor (identical semantics to pop(), n slots at a time).
+        ZRQUEUE_NODISCARD ZRQUEUE_FORCE_INLINE T* front_bulk(size_t want, size_t& available) noexcept {
+            available = 0;
+            if (ZRQUEUE_UNLIKELY(want == 0)) {
+                return nullptr;
+            }
+            const uint64_t read_index = read_index_.load(std::memory_order_relaxed);
+            if (ZRQUEUE_UNLIKELY(read_index == cached_write_index_)) {
+                cached_write_index_ = write_index_.load(std::memory_order_acquire);
+                if (ZRQUEUE_UNLIKELY(read_index == cached_write_index_)) {
+                    return nullptr;
+                }
+            }
+            size_t count = static_cast<size_t>(cached_write_index_ - read_index);
+            if (count > want) {
+                count = want;
+            }
+            const size_t offset = static_cast<size_t>(read_index & MASK);
+            const size_t till_wrap = N - offset;
+            if (count > till_wrap) {
+                count = till_wrap;
+            }
+            available = count;
+            return &data_[offset];
+        }
+
+        ZRQUEUE_FORCE_INLINE void pop_bulk(size_t n) noexcept {
+            if (ZRQUEUE_UNLIKELY(n == 0)) {
+                return;
+            }
+            const uint64_t read_index = read_index_.load(std::memory_order_relaxed);
+#ifndef NDEBUG
+            assert(n <= cached_write_index_ - read_index && "pop_bulk(n) exceeds the published backlog");
+#endif
+            read_index_.store(read_index + n, std::memory_order_release);
         }
 
         template<typename Reader>
@@ -1063,6 +1270,8 @@ namespace zrqueue {
         // ------------------------------------------------------------------------
         template <typename THandler>
         ZRQUEUE_NODISCARD size_t consume_bulk(THandler&& handler, size_t max_count = 0) noexcept {
+            static_assert(std::is_nothrow_invocable_v<THandler, T&>,
+                          "consume_bulk is noexcept: handler must be nothrow-invocable with T&");
             const uint64_t read_index = read_index_.load(std::memory_order_relaxed);
 
             if (ZRQUEUE_UNLIKELY(read_index == cached_write_index_)) {
@@ -1083,14 +1292,22 @@ namespace zrqueue {
             return count_to_consume;
         }
 
+        // Observability only: reads two indices independently, so the result is a
+        // stale, non-atomic snapshot. Never gate flow control on it - use
+        // try_push/try_emplace/try_pop, which decide on the producer/consumer side.
         ZRQUEUE_NODISCARD ZRQUEUE_FORCE_INLINE size_t size() const noexcept {
-            uint64_t w = write_index_.load(std::memory_order_acquire);
-            uint64_t r = read_index_.load(std::memory_order_acquire);
+            uint64_t w = write_index_.load(std::memory_order_relaxed);
+            uint64_t r = read_index_.load(std::memory_order_relaxed);
+            // Two independent loads, not a snapshot: r may be observed ahead of w
+            // (consumer drained past the w we read), so guard the subtraction.
             return (w >= r) ? static_cast<size_t>(w - r) : 0;
         }
 
+        // Observability only; same snapshot caveat as size().
         ZRQUEUE_NODISCARD ZRQUEUE_FORCE_INLINE bool empty() const noexcept {
-            return write_index_.load(std::memory_order_acquire) == read_index_.load(std::memory_order_acquire);
+            uint64_t w = write_index_.load(std::memory_order_relaxed);
+            uint64_t r = read_index_.load(std::memory_order_relaxed);
+            return w == r;
         }
 
         ZRQUEUE_NODISCARD ZRQUEUE_FORCE_INLINE constexpr size_t capacity() const noexcept {
@@ -1114,8 +1331,9 @@ namespace zrqueue {
         alignas(ZRQUEUE_CACHE_LINE_SIZE) std::atomic<uint64_t> read_index_{ 0 };
         alignas(ZRQUEUE_CACHE_LINE_SIZE) uint64_t cached_write_index_ { 0 };
 
-        // Data Zone
-        alignas(ZRQUEUE_CACHE_LINE_SIZE) std::array<T, N> data_ { };
+        // Data Zone. alignas(T) keeps over-aligned element types legal: a bare
+        // alignas(64) would be weaker than alignof(T) for e.g. alignas(128) types.
+        alignas(ZRQUEUE_CACHE_LINE_SIZE) alignas(T) std::array<T, N> data_ { };
     };  // end SpscRingBuffer
 
     // ============================================================================
@@ -1182,8 +1400,13 @@ namespace zrqueue {
             }
         }
         ~SpscMirrorQueue() {
-            while (front()) {
-                pop();
+            // Destruction implies quiescence: walk the live range directly.
+            if constexpr (!std::is_trivially_destructible_v<T>) {
+                const uint64_t head = read_index_.load(std::memory_order_relaxed);
+                const uint64_t tail = write_index_.load(std::memory_order_relaxed);
+                for (uint64_t i = head; i < tail; ++i) {
+                    slot_at(i)->~T();
+                }
             }
         }
 
@@ -1295,25 +1518,31 @@ namespace zrqueue {
         // optimization only); the slot is always valid for any in-queue element.
         ZRQUEUE_NODISCARD ZRQUEUE_FORCE_INLINE T* peek(size_t offset = 0) noexcept {
             const uint64_t read_index = read_index_.load(std::memory_order_relaxed);
-            const uint64_t new_read_index = read_index + offset;
-            if (ZRQUEUE_UNLIKELY(new_read_index >= cached_write_index_)) {
+            const uint64_t off = static_cast<uint64_t>(offset);
+            if (ZRQUEUE_UNLIKELY(off >= cached_write_index_ - read_index)) {
                 cached_write_index_ = write_index_.load(std::memory_order_acquire);
-                if (ZRQUEUE_UNLIKELY(new_read_index >= cached_write_index_)) {
+                if (ZRQUEUE_UNLIKELY(off >= cached_write_index_ - read_index)) {
                     return nullptr;
                 }
             }
-            return slot_at(new_read_index);
+            return slot_at(read_index + off);
         }
 
+        // Observability only: reads two indices independently, so the result is a
+        // stale, non-atomic snapshot. Never gate flow control on it - use
+        // try_push/try_emplace/try_pop, which decide on the producer/consumer side.
         ZRQUEUE_NODISCARD ZRQUEUE_FORCE_INLINE size_t size() const noexcept {
-            const uint64_t w = write_index_.load(std::memory_order_acquire);
-            const uint64_t r = read_index_.load(std::memory_order_acquire);
+            const uint64_t w = write_index_.load(std::memory_order_relaxed);
+            const uint64_t r = read_index_.load(std::memory_order_relaxed);
+            // Two independent loads, not a snapshot: guard the subtraction.
             return (w >= r) ? static_cast<size_t>(w - r) : 0;
         }
 
+        // Observability only; same snapshot caveat as size().
         ZRQUEUE_NODISCARD ZRQUEUE_FORCE_INLINE bool empty() const noexcept {
-            return write_index_.load(std::memory_order_acquire) ==
-                   read_index_.load(std::memory_order_acquire);
+            uint64_t w = write_index_.load(std::memory_order_relaxed);
+            uint64_t r = read_index_.load(std::memory_order_relaxed);
+            return w == r;
         }
 
         ZRQUEUE_NODISCARD ZRQUEUE_FORCE_INLINE constexpr size_t capacity() const noexcept {

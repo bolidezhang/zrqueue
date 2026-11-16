@@ -203,6 +203,227 @@ void testBoundaryOne(Q& q, uint32_t cap) {
     }
 }
 
+template <typename T, typename Q>
+void testPeekOverflowOne(Q& q, uint32_t cap) {
+    // Advance read_index far enough that a large offset would wrap it back into
+    // the live window instead of landing past write_index.
+    const uint64_t laps = 125;
+    for (uint64_t lap = 0; lap < laps; ++lap) {
+        for (uint32_t i = 0; i < cap; ++i) {
+            CHECK(tryPut<T>(q, lap * cap + i));
+        }
+        for (uint32_t i = 0; i < cap; ++i) {
+            CHECK(q.front() != nullptr);
+            q.pop();
+        }
+    }
+
+    const uint64_t base = laps * cap; // == read_index after the laps
+    CHECK(tryPut<T>(q, base));
+
+    T* p0 = q.peek(0);
+    CHECK(p0 != nullptr);
+    if (p0) {
+        CHECK(checkVal(*p0, base));
+    }
+    CHECK(q.peek(1) == nullptr);
+
+    // Offsets that wrap the index arithmetic must be rejected. Before the fix
+    // these aliased slot 0 (already consumed) instead of returning nullptr.
+    CHECK(q.peek(SIZE_MAX) == nullptr);
+    CHECK(q.peek(static_cast<size_t>(0) - 1) == nullptr);
+    CHECK(q.peek(static_cast<size_t>(0) - static_cast<size_t>(base)) == nullptr);
+    CHECK(q.peek(static_cast<size_t>(0) - static_cast<size_t>(base - 1)) == nullptr);
+
+    T* f = q.front();
+    CHECK(f != nullptr);
+    if (f) {
+        CHECK(checkVal(*f, base));
+    }
+    q.pop();
+    CHECK(q.empty());
+}
+
+template <typename T, uint32_t Cap>
+void testPeekOverflow() {
+    {
+        zrqueue::SpscHeapQueue<T> q(Cap);
+        testPeekOverflowOne<T>(q, Cap);
+    }
+    {
+        auto q = std::make_unique<zrqueue::SpscInlineQueue<T, Cap>>();
+        testPeekOverflowOne<T>(*q, Cap);
+    }
+    {
+        auto q = std::make_unique<zrqueue::SpscMirrorQueue<T, Cap>>();
+        testPeekOverflowOne<T>(*q, Cap);
+    }
+    {
+        auto q = std::make_unique<zrqueue::SpscRingBuffer<T, Cap>>();
+        testPeekOverflowOne<T>(*q, Cap);
+    }
+}
+
+template <typename T, typename Q>
+void testFrontBulkOne(Q& q, uint32_t cap) {
+    size_t available = 99;
+    CHECK(q.front_bulk(0, available) == nullptr);
+    CHECK(available == 0);
+    CHECK(q.front_bulk(4, available) == nullptr); // empty queue
+    CHECK(available == 0);
+
+    // Partial claim: want smaller than backlog.
+    for (uint32_t i = 0; i < cap; ++i) {
+        CHECK(tryPut<T>(q, i));
+    }
+    const size_t half = cap / 2;
+    T* p = q.front_bulk(half, available);
+    CHECK(p != nullptr);
+    CHECK(available == half);
+    for (size_t i = 0; i < available; ++i) {
+        CHECK(checkVal(p[i], i));
+    }
+    q.pop_bulk(available);
+    CHECK(q.size() == cap - half);
+
+    // Drain in contiguous chunks until empty; order must be preserved.
+    uint64_t expect = half;
+    while (true) {
+        size_t got = 0;
+        T* batch = q.front_bulk(cap, got);
+        if (batch == nullptr) {
+            break;
+        }
+        CHECK(got > 0);
+        for (size_t i = 0; i < got; ++i) {
+            CHECK(checkVal(batch[i], expect + i));
+        }
+        q.pop_bulk(got);
+        expect += got;
+    }
+    CHECK(expect == cap);
+    CHECK(q.empty());
+
+    // Wrap clamp: leave the cursor one slot before the physical end.
+    for (uint32_t i = 0; i < cap; ++i) {
+        CHECK(tryPut<T>(q, cap + i));
+    }
+    for (uint32_t i = 0; i + 1 < cap; ++i) {
+        q.pop();
+    }
+    size_t clamped = 0;
+    T* last = q.front_bulk(cap, clamped);
+    CHECK(last != nullptr);
+    CHECK(clamped == 1); // never straddles the wrap point
+    CHECK(checkVal(last[0], cap + cap - 1));
+    q.pop_bulk(clamped);
+    CHECK(q.empty());
+}
+
+template <typename T, uint32_t Cap>
+void testFrontBulk() {
+    {
+        zrqueue::SpscHeapQueue<T> q(Cap);
+        testFrontBulkOne<T>(q, Cap);
+    }
+    {
+        auto q = std::make_unique<zrqueue::SpscInlineQueue<T, Cap>>();
+        testFrontBulkOne<T>(*q, Cap);
+    }
+    {
+        auto q = std::make_unique<zrqueue::SpscRingBuffer<T, Cap>>();
+        testFrontBulkOne<T>(*q, Cap);
+    }
+}
+
+// front_bulk()/pop_bulk() on non-POD elements must destroy exactly n objects.
+void testFrontBulkLifetime() {
+    const int base = PayloadNonPod::alive();
+    {
+        zrqueue::SpscHeapQueue<PayloadNonPod> q(8);
+        for (uint64_t i = 0; i < 4; ++i) {
+            q.emplace(i);
+        }
+        CHECK(PayloadNonPod::alive() == base + 4);
+        size_t available = 0;
+        PayloadNonPod* p = q.front_bulk(4, available);
+        CHECK(p != nullptr);
+        CHECK(available == 4);
+        q.pop_bulk(available);
+        CHECK(PayloadNonPod::alive() == base);
+    }
+    CHECK(PayloadNonPod::alive() == base);
+}
+
+// A type requiring 128-byte alignment must come back 128-aligned from every
+// model: the default allocator used to cap at one cache line (64).
+struct alignas(128) AlignedMsg {
+    uint64_t seq;
+    uint64_t pad[15];
+    explicit AlignedMsg(uint64_t s = 0) noexcept : seq(s), pad{} {}
+};
+static_assert(alignof(AlignedMsg) == 128, "probe payload must require 128-byte alignment");
+static_assert(sizeof(AlignedMsg) == 128, "probe payload must be exactly 128 bytes");
+
+template <typename Q, typename Put>
+void checkAlignedSlot(Q& q, Put put, const char* model) {
+    put(q, 7);
+    const void* p = q.front();
+    CHECK(p != nullptr);
+    const uintptr_t addr = reinterpret_cast<uintptr_t>(p);
+    CHECK(addr % alignof(AlignedMsg) == 0);
+    if (addr % alignof(AlignedMsg) != 0) {
+        std::fprintf(stderr, "  [%s] misaligned slot: 0x%llx\n", model,
+                     static_cast<unsigned long long>(addr));
+    }
+}
+
+void testOverAlignedType() {
+    // Repeat allocations: a single 64-aligned block lands 128-aligned by chance
+    // about half the time, so one sample cannot prove the fix.
+    for (int round = 0; round < 8; ++round) {
+        {
+            zrqueue::SpscHeapQueue<AlignedMsg> q(4);
+            checkAlignedSlot(q, [](auto& qq, int v) { qq.push(AlignedMsg(static_cast<uint64_t>(v))); },
+                             "HeapQueue");
+        }
+        {
+            auto q = std::make_unique<zrqueue::SpscInlineQueue<AlignedMsg, 4>>();
+            checkAlignedSlot(*q, [](auto& qq, int v) { qq.push(AlignedMsg(static_cast<uint64_t>(v))); },
+                             "InlineQueue");
+        }
+        {
+            auto q = std::make_unique<zrqueue::SpscMirrorQueue<AlignedMsg, 4>>();
+            checkAlignedSlot(*q, [](auto& qq, int v) { qq.push(AlignedMsg(static_cast<uint64_t>(v))); },
+                             "MirrorQueue");
+        }
+        {
+            auto q = std::make_unique<zrqueue::SpscRingBuffer<AlignedMsg, 4>>();
+            checkAlignedSlot(*q,
+                             [](auto& qq, int v) { qq.push([v](AlignedMsg* p) { p->seq = static_cast<uint64_t>(v); }); },
+                             "RingBuffer");
+        }
+    }
+
+    // HeapQueue slots are contiguous: element i sits at base + i*sizeof(T),
+    // so an aligned base keeps every element aligned.
+    {
+        zrqueue::SpscHeapQueue<AlignedMsg> q(4);
+        for (int i = 0; i < 4; ++i) {
+            q.push(AlignedMsg(static_cast<uint64_t>(i)));
+        }
+        size_t available = 0;
+        AlignedMsg* batch = q.front_bulk(4, available);
+        CHECK(batch != nullptr);
+        CHECK(available == 4);
+        for (size_t i = 0; i < available; ++i) {
+            const uintptr_t addr = reinterpret_cast<uintptr_t>(batch + i);
+            CHECK(addr % alignof(AlignedMsg) == 0);
+        }
+        q.pop_bulk(available);
+    }
+}
+
 template <typename T, uint32_t Cap>
 void testBoundaries() {
     {
@@ -231,7 +452,7 @@ void testBulk() {
         CHECK(q.size() == 8);
         CHECK(q.push_bulk(buf, 1) == 0);
         int expect = 0;
-        CHECK(q.consume_bulk([&](int& v) { CHECK(v == expect); ++expect; }) == 8);
+        CHECK(q.consume_bulk([&](int& v) noexcept { CHECK(v == expect); ++expect; }) == 8);
         CHECK(expect == 8);
         CHECK(q.empty());
     }
@@ -240,9 +461,9 @@ void testBulk() {
         int buf[3] = { 11, 12, 13 };
         CHECK(q.push_bulk(buf, 3) == 3);
         int expect = 11;
-        CHECK(q.consume_bulk([&](int& v) { CHECK(v == expect); ++expect; }, 2) == 2);
+        CHECK(q.consume_bulk([&](int& v) noexcept { CHECK(v == expect); ++expect; }, 2) == 2);
         CHECK(q.size() == 1);
-        CHECK(q.consume_bulk([](int& v) { CHECK(v == 13); }) == 1);
+        CHECK(q.consume_bulk([](int& v) noexcept { CHECK(v == 13); }) == 1);
         CHECK(q.empty());
     }
     {
@@ -252,7 +473,7 @@ void testBulk() {
             PayloadNonPod buf[4] = { PayloadNonPod(0), PayloadNonPod(1),
                                     PayloadNonPod(2), PayloadNonPod(3) };
             CHECK(q.push_bulk(buf, 4) == 4);
-            CHECK(q.consume_bulk([](PayloadNonPod&) {}) == 4);
+            CHECK(q.consume_bulk([](PayloadNonPod&) noexcept {}) == 4);
             CHECK(PayloadNonPod::alive() == base + 4);
         }
         CHECK(PayloadNonPod::alive() == base);
@@ -267,7 +488,7 @@ void testNonPodLifetime() {
             q.emplace(i);
         }
         CHECK(PayloadNonPod::alive() == base + 5);
-        CHECK(q.consume_bulk([](PayloadNonPod&) {}) == 5);
+        CHECK(q.consume_bulk([](PayloadNonPod&) noexcept {}) == 5);
         CHECK(PayloadNonPod::alive() == base);
     }
     CHECK(PayloadNonPod::alive() == base);
@@ -297,7 +518,7 @@ void testNonPodLifetime() {
         for (uint64_t i = 0; i < 3; ++i) {
             q->push([&](PayloadNonPod* p) { p->seq = i; });
         }
-        CHECK(q->consume_bulk([](PayloadNonPod&) {}) == 3);
+        CHECK(q->consume_bulk([](PayloadNonPod&) noexcept {}) == 3);
     }
     CHECK(PayloadNonPod::alive() == base);
 }
@@ -388,7 +609,7 @@ void testClaimCommit() {
             q.push();
         }
         int expect = 0;
-        CHECK(q.consume_bulk([&](int& v) { CHECK(v == expect); ++expect; }) == 5);
+        CHECK(q.consume_bulk([&](int& v) noexcept { CHECK(v == expect); ++expect; }) == 5);
         CHECK(expect == 5);
         CHECK(q.empty());
     }
@@ -544,6 +765,16 @@ int main(int argc, char* argv[]) {
     testBoundaries<int, 2>();
     testBoundaries<PayloadBig, 8>();
     testBoundaries<PayloadNonPod, 8>();
+
+    testPeekOverflow<int, 8>();
+    testPeekOverflow<int, 2>();
+    testPeekOverflow<PayloadNonPod, 8>();
+
+    testFrontBulk<int, 8>();
+    testFrontBulk<int, 2>();
+    testFrontBulk<PayloadNonPod, 8>();
+    testFrontBulkLifetime();
+    testOverAlignedType();
 
     testBulk();
     testNonPodLifetime();

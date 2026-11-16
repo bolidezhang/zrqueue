@@ -253,7 +253,7 @@ static void runThroughputSuite(int cpu1, int cpu2, const char* note) {
                       } },
                 [&] { int64_t expect = 0;
                       while (expect < TPUT_ITERS) {
-                          size_t n = q->consume_bulk([&](int& v) {
+                          size_t n = q->consume_bulk([&](int& v) noexcept {
                               if (v != static_cast<int>(expect)) orderViolation("RingBuffer bulk");
                               ++expect; });
                           if (n == 0) ZRQUEUE_CPU_PAUSE();
@@ -277,7 +277,7 @@ static void runThroughputSuite(int cpu1, int cpu2, const char* note) {
                       } },
                 [&] { int64_t expect = 0;
                       while (expect < TPUT_ITERS) {
-                          size_t n = q.consume_bulk([&](int& v) {
+                          size_t n = q.consume_bulk([&](int& v) noexcept {
                               if (v != static_cast<int>(expect)) orderViolation("HeapQueue bulk");
                               ++expect; });
                           if (n == 0) ZRQUEUE_CPU_PAUSE();
