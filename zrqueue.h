@@ -49,7 +49,7 @@ SOFTWARE.
     #error "zrqueue requires if constexpr (__cpp_if_constexpr missing)"
 #endif
 
-#define ZRQUEUE_VERSION 10900   //1.9.0
+#define ZRQUEUE_VERSION 10901   //1.9.1
 
 #include <atomic>
 #include <array>
@@ -1033,7 +1033,12 @@ namespace zrqueue {
         SpscRingBuffer(SpscRingBuffer&&) = delete;
         SpscRingBuffer& operator=(SpscRingBuffer&&) = delete;
 
-        ZRQUEUE_NODISCARD ZRQUEUE_FORCE_INLINE T* alloc() {
+        // Claims one slot without publishing it. Every successful alloc() MUST be
+        // paired with exactly one push(); every alloc_bulk() with one commit(n).
+        // A missing commit leaves the slot unpublished (lost, not corrupted) and
+        // trips the Debug-only pending_claim_ assertion on the next claim; Release
+        // builds are silent. A second alloc() before push() overwrites the slot.
+        ZRQUEUE_NODISCARD ZRQUEUE_FORCE_INLINE T* alloc() noexcept {
             const uint64_t write_index = write_index_.load(std::memory_order_relaxed);
             const uint64_t next_write_index = write_index + 1;
 
@@ -1050,6 +1055,7 @@ namespace zrqueue {
             assert(pending_claim_ == 0 && "alloc() called again before push()/commit(): previous claim not committed");
             pending_claim_ = 1;
 #endif
+            claimed_index_ = write_index;
             return &data_[write_index & MASK];
         }
 
@@ -1068,6 +1074,7 @@ namespace zrqueue {
             assert(pending_claim_ == 0 && "spin_alloc() called again before push()/commit(): previous claim not committed");
             pending_claim_ = 1;
 #endif
+            claimed_index_ = write_index;
             return &data_[write_index & MASK];
         }
 
@@ -1109,31 +1116,33 @@ namespace zrqueue {
             assert(pending_claim_ == 0 && "alloc_bulk() called again before commit(): previous claim not committed");
             pending_claim_ = count;
 #endif
+            claimed_index_ = write_index;
             granted = count;
             return &data_[offset];
         }
 
-        ZRQUEUE_FORCE_INLINE void push() {
+        ZRQUEUE_FORCE_INLINE void push() noexcept {
 #ifndef NDEBUG
             // push() commits exactly ONE slot; committing a bulk claim slot-by-slot would
             // silently strand the rest (never visible to the consumer, later re-claimed)
             assert(pending_claim_ == 1 && "push() commits a single alloc(); use commit(n) for alloc_bulk()");
             pending_claim_ = 0;
 #endif
-            const uint64_t write_index = write_index_.load(std::memory_order_relaxed);
-            const uint64_t next_write_index = write_index + 1;
-            write_index_.store(next_write_index, std::memory_order_release);
+            write_index_.store(claimed_index_ + 1, std::memory_order_release);
         }
 
         // Commits n slots of a pending alloc_bulk() claim (n <= granted) with exactly ONE
         // release barrier. Slots beyond n are silently abandoned and re-claimed by a future alloc.
-        ZRQUEUE_FORCE_INLINE void commit(size_t n) {
+        // n == 0 is a no-op, matching pop_bulk(0).
+        ZRQUEUE_FORCE_INLINE void commit(size_t n) noexcept {
+            if (ZRQUEUE_UNLIKELY(n == 0)) {
+                return;
+            }
 #ifndef NDEBUG
-            assert(n >= 1 && n <= pending_claim_ && "commit(n): n must be within the pending alloc_bulk() claim");
+            assert(n <= pending_claim_ && "commit(n): n must be within the pending alloc_bulk() claim");
             pending_claim_ = 0;
 #endif
-            const uint64_t write_index = write_index_.load(std::memory_order_relaxed);
-            write_index_.store(write_index + n, std::memory_order_release);
+            write_index_.store(claimed_index_ + n, std::memory_order_release);
         }
 
         template<typename Writer>
@@ -1147,14 +1156,19 @@ namespace zrqueue {
             return false;
         }
 
+        // The writer must not throw: a claim is already outstanding when it runs, so
+        // an exception leaves that claim unpublished (Release: the slot is silently
+        // reused; Debug: pending_claim_ trips on the next claim). Not enforced with a
+        // static_assert because a plain lambda is not nothrow-invocable by default;
+        // wrap throwing work in alloc() + your own try/catch + commit() instead.
         template<typename Writer>
         ZRQUEUE_FORCE_INLINE void push(Writer&& writer) {
             if constexpr (sizeof(T) > ZRQUEUE_CACHE_LINE_SIZE) {
                 // Multi-cache-line payloads: try_push's bool return and nullptr
                 // failure path force a stack frame, two register spills and two
-                // extra branches (MSVC /O2). Claiming directly avoids them;
-                // measured +26% at 128B. Small payloads keep the compact
-                // try_push loop, which wins there.
+                // extra branches (MSVC /O2). spin_alloc keeps one straight-line
+                // claim path; measured +26% at 128B. Small payloads keep the
+                // compact try_push loop, which wins there.
                 T* v = spin_alloc();
                 std::forward<Writer>(writer)(v);
                 push();
@@ -1165,7 +1179,7 @@ namespace zrqueue {
             }
         }
 
-        ZRQUEUE_NODISCARD ZRQUEUE_FORCE_INLINE T* front() {
+        ZRQUEUE_NODISCARD ZRQUEUE_FORCE_INLINE T* front() noexcept {
             const uint64_t read_index = read_index_.load(std::memory_order_relaxed);
             if (ZRQUEUE_UNLIKELY(read_index == cached_write_index_)) {
                 cached_write_index_ = write_index_.load(std::memory_order_acquire);
@@ -1192,7 +1206,7 @@ namespace zrqueue {
             }
         }
 
-        ZRQUEUE_FORCE_INLINE void pop() {
+        ZRQUEUE_FORCE_INLINE void pop() noexcept {
             const uint64_t read_index = read_index_.load(std::memory_order_relaxed);
             const uint64_t next_read_index = read_index + 1;
             read_index_.store(next_read_index, std::memory_order_release);
@@ -1320,6 +1334,10 @@ namespace zrqueue {
         // [Cache Line]: Producer Zone
         alignas(ZRQUEUE_CACHE_LINE_SIZE) std::atomic<uint64_t> write_index_{ 0 };
         alignas(ZRQUEUE_CACHE_LINE_SIZE) uint64_t cached_read_index_ { 0 };
+        // Index handed out by the pending claim. push()/commit() advance from this
+        // instead of re-loading write_index_ (the atomic cannot be cached across the
+        // caller's writer call, so the reload was a real load on the release path).
+        uint64_t claimed_index_{ 0 };
 #ifndef NDEBUG
         // Debug-only misuse detector: number of claimed-but-uncommitted slots
         // (1 from alloc()/spin_alloc(), k from alloc_bulk()). Producer-local,

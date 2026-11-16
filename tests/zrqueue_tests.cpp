@@ -613,6 +613,24 @@ void testClaimCommit() {
         CHECK(expect == 5);
         CHECK(q.empty());
     }
+    {
+        // commit(0) is a no-op, matching pop_bulk(0): nothing is published and the
+        // pending claim stays intact for a later commit(n).
+        zrqueue::SpscRingBuffer<int, 8> q;
+        size_t granted = 0;
+        int* batch = q.alloc_bulk(4, granted);
+        CHECK(batch != nullptr);
+        CHECK(granted == 4);
+        q.commit(0);
+        CHECK(q.empty());
+        CHECK(q.size() == 0);
+        batch[0] = 70;
+        q.commit(1);
+        CHECK(q.size() == 1);
+        CHECK(*q.front() == 70);
+        q.pop();
+        CHECK(q.empty());
+    }
 }
 
 void suppressAssertDialog() {
@@ -646,11 +664,6 @@ int runDeathChild(const char* name) {
         size_t granted = 0;
         (void)q.alloc_bulk(4, granted);
         q.commit(granted + 1);
-    } else if (!std::strcmp(name, "zero_commit")) {
-        zrqueue::SpscRingBuffer<int, 8> q;
-        size_t granted = 0;
-        (void)q.alloc_bulk(4, granted);
-        q.commit(0);
     } else if (!std::strcmp(name, "commit_without_claim")) {
         zrqueue::SpscRingBuffer<int, 8> q;
         q.commit(1);
@@ -722,7 +735,7 @@ void testRingPushLargePayload() {
 void testDeathCases(const char* self) {
     static const char* cases[] = {
         "double_alloc", "double_spin_alloc", "bulk_then_push",
-        "over_commit", "zero_commit", "commit_without_claim"
+        "over_commit", "commit_without_claim"
     };
     for (const char* c : cases) {
         ++g_checks;
