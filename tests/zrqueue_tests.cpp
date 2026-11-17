@@ -26,6 +26,28 @@
     #include <unistd.h>
 #endif
 
+// 4 B type that opts the mirror off: must fall back to the classic path.
+struct MirrorOptOut4 {
+    uint32_t v;
+    MirrorOptOut4(uint64_t s = 0) noexcept : v(static_cast<uint32_t>(s)) {}
+};
+
+namespace zrqueue {
+template <>
+struct mirror_traits<MirrorOptOut4> {
+    static constexpr bool enable_4b = false;
+    static constexpr bool enable_8b = false;
+};
+} // namespace zrqueue
+
+// Custom 8 B type without an opt-in: the default policy keeps it classic.
+struct MirrorDefault8 {
+    uint32_t lo, hi;
+    MirrorDefault8(uint64_t s = 0) noexcept
+        : lo(static_cast<uint32_t>(s)), hi(static_cast<uint32_t>(s >> 32)) {}
+};
+static_assert(sizeof(MirrorDefault8) == 8, "MirrorDefault8 must be 8 bytes");
+
 namespace {
 
 int g_checks = 0;
@@ -44,6 +66,9 @@ template <typename T>
 uint64_t seqOf(const T& v) { return static_cast<uint64_t>(v); }
 uint64_t seqOf(const PayloadBig& v) { return v.seq; }
 uint64_t seqOf(const PayloadNonPod& v) { return v.seq; }
+uint64_t seqOf(const PayloadScalar8& v) { return v.seq; }
+uint64_t seqOf(const PayloadTwo32& v) { return v.bits(); }
+uint64_t seqOf(const PayloadNarrow4& v) { return v.bits(); }
 
 template <typename T>
 void setSeq(T& v, uint64_t s) { v = static_cast<T>(s); }
@@ -732,6 +757,486 @@ void testRingPushLargePayload() {
     CHECK(q.empty());
 }
 
+void testMirrorPackedApi() {
+    // 4 B explicit payload API.
+    {
+        zrqueue::SpscMirrorQueue<int, 8> q;
+        static_assert(decltype(q)::mirror_enabled, "int must use the 4 B mirror");
+        static_assert(decltype(q)::mirror_window == 4, "4 B mirror window must be 4");
+        for (uint32_t i = 0; i < 8; ++i) {
+            CHECK(q.try_emplace_packed(i, static_cast<int>(i)));
+        }
+        CHECK(!q.try_emplace_packed(8u, 8));
+        for (int i = 0; i < 8; ++i) {
+            int* f = q.front();
+            CHECK(f != nullptr);
+            if (f) {
+                CHECK(*f == i);
+            }
+            q.pop();
+        }
+        CHECK(q.empty());
+        q.push_packed(42u, 42);
+        CHECK(*q.front() == 42);
+        q.pop();
+        CHECK(q.empty());
+        CHECK(q.try_push_packed(43u, 43));
+        CHECK(*q.front() == 43);
+        q.pop();
+        CHECK(q.empty());
+    }
+    // Blocking emplace_packed must refresh the cached read index when full.
+    {
+        zrqueue::SpscMirrorQueue<int, 2> q;
+        q.emplace_packed(1u, 1);
+        q.emplace_packed(2u, 2);
+        CHECK(*q.front() == 1);
+        q.pop();
+        q.emplace_packed(3u, 3);
+        CHECK(*q.front() == 2);
+        q.pop();
+        CHECK(*q.front() == 3);
+        q.pop();
+        CHECK(q.empty());
+    }
+    // 8 B arithmetic scalar uses the seqlock mirror by default.
+    {
+        zrqueue::SpscMirrorQueue<uint64_t, 8> q;
+        static_assert(decltype(q)::mirror_enabled, "uint64_t must use the 8 B mirror");
+        static_assert(decltype(q)::mirror_window == 2, "8 B mirror window must be 2");
+        for (uint64_t i = 0; i < 8; ++i) {
+            CHECK(q.try_emplace_packed(i, i));
+        }
+        CHECK(!q.try_emplace_packed(8u, 8u));
+        for (uint64_t i = 0; i < 8; ++i) {
+            uint64_t* f = q.front();
+            CHECK(f != nullptr);
+            if (f) {
+                CHECK(*f == i);
+            }
+            q.pop();
+        }
+        CHECK(q.empty());
+        q.push_packed(0x123456789ABCDEF0ULL, 0x123456789ABCDEF0ULL);
+        CHECK(*q.front() == 0x123456789ABCDEF0ULL);
+        q.pop();
+    }
+    // Custom 8 B type opted in via mirror_traits; packed payload avoids the
+    // two-store read-back stall (correctness is what this test checks).
+    {
+        zrqueue::SpscMirrorQueue<PayloadTwo32, 8> q;
+        static_assert(decltype(q)::mirror_enabled, "PayloadTwo32 must be opted in");
+        for (uint64_t i = 0; i < 8; ++i) {
+            CHECK(q.try_emplace_packed(i, i));
+        }
+        CHECK(!q.try_emplace_packed(8u, 8u));
+        for (uint64_t i = 0; i < 8; ++i) {
+            PayloadTwo32* f = q.front();
+            CHECK(f != nullptr);
+            if (f) {
+                CHECK(f->bits() == i);
+            }
+            q.pop();
+        }
+        CHECK(q.empty());
+    }
+    // 4 B narrow-store type: mirror_codec derives the payload from the
+    // constructor argument, so the normal emplace() path stays fast.
+    {
+        zrqueue::SpscMirrorQueue<PayloadNarrow4, 8> q;
+        static_assert(decltype(q)::mirror_enabled, "PayloadNarrow4 must use the 4 B mirror");
+        for (uint64_t i = 0; i < 8; ++i) {
+            q.emplace(i); // codec path: pack from the argument
+        }
+        for (uint64_t i = 0; i < 8; ++i) {
+            PayloadNarrow4* f = q.front();
+            CHECK(f != nullptr);
+            if (f) {
+                CHECK(f->bits() == i);
+            }
+            q.pop();
+        }
+        CHECK(q.empty());
+        for (uint64_t i = 8; i < 16; ++i) {
+            q.emplace_packed(static_cast<uint32_t>(i), i);
+        }
+        for (uint64_t i = 8; i < 16; ++i) {
+            PayloadNarrow4* f = q.front();
+            CHECK(f != nullptr);
+            if (f) {
+                CHECK(f->bits() == i);
+            }
+            q.pop();
+        }
+        CHECK(q.empty());
+    }
+}
+
+template <typename T>
+void testMirrorHitPath() {
+    using Q = zrqueue::SpscMirrorQueue<T, 8>;
+    static_assert(Q::mirror_enabled, "testMirrorHitPath requires a mirrored type");
+    Q q;
+    q.emplace(static_cast<uint64_t>(7));
+    T* front_ptr = q.front();
+    T* slot_ptr = q.peek(0); // peek() always returns the authoritative slot
+    CHECK(front_ptr != nullptr);
+    CHECK(slot_ptr != nullptr);
+    CHECK(front_ptr != slot_ptr); // front() served from the consumer-local stash
+    q.pop();
+    CHECK(q.empty());
+}
+
+template <typename T>
+void testMirrorDisabledPath() {
+    using Q = zrqueue::SpscMirrorQueue<T, 8>;
+    static_assert(!Q::mirror_enabled, "testMirrorDisabledPath requires a classic type");
+    Q q;
+    q.emplace(static_cast<uint64_t>(7));
+    T* front_ptr = q.front();
+    T* slot_ptr = q.peek(0);
+    CHECK(front_ptr != nullptr);
+    CHECK(slot_ptr != nullptr);
+    CHECK(front_ptr == slot_ptr); // no mirror: front() returns the slot itself
+    q.pop();
+    CHECK(q.empty());
+}
+
+void testMirrorPolicyFallback() {
+    // Explicit opt-out on a 4 B type: no mirror entries are consulted.
+    {
+        using Q = zrqueue::SpscMirrorQueue<MirrorOptOut4, 8>;
+        static_assert(!Q::mirror_enabled, "MirrorOptOut4 must not use the mirror");
+        static_assert(Q::mirror_window == 0, "disabled mirror window must be 0");
+        Q q;
+        for (uint64_t i = 0; i < 8; ++i) {
+            CHECK(q.try_emplace(i));
+        }
+        CHECK(!q.try_emplace(8u));
+        for (uint64_t i = 0; i < 8; ++i) {
+            MirrorOptOut4* f = q.front();
+            CHECK(f != nullptr);
+            if (f) {
+                CHECK(f->v == i);
+            }
+            q.pop();
+        }
+        CHECK(q.empty());
+    }
+    // Custom 8 B type without an opt-in stays on the classic path.
+    {
+        using Q = zrqueue::SpscMirrorQueue<MirrorDefault8, 8>;
+        static_assert(!Q::mirror_enabled, "custom 8 B types must default to classic");
+        Q q;
+        for (uint64_t i = 0; i < 8; ++i) {
+            CHECK(q.try_emplace(i));
+        }
+        CHECK(!q.try_emplace(8u));
+        for (uint64_t i = 0; i < 8; ++i) {
+            MirrorDefault8* f = q.front();
+            CHECK(f != nullptr);
+            if (f) {
+                CHECK(f->lo == static_cast<uint32_t>(i));
+                CHECK(f->hi == static_cast<uint32_t>(i >> 32));
+            }
+            q.pop();
+        }
+        CHECK(q.empty());
+    }
+}
+
+void testMirrorConsumeBulk() {
+    // Empty queue: nothing consumed, indices untouched.
+    {
+        zrqueue::SpscMirrorQueue<int, 8> q;
+        size_t seen = 0;
+        CHECK(q.consume_bulk([&](int&) noexcept { ++seen; }) == 0);
+        CHECK(seen == 0);
+        CHECK(q.empty());
+    }
+    // 4 B mirror: a shallow run is served from the mirror entries (seq matches),
+    // so the handler must still see the right values in order.
+    {
+        zrqueue::SpscMirrorQueue<int, 8> q;
+        for (int i = 0; i < 5; ++i) {
+            q.emplace(i);
+        }
+        int expect = 0;
+        const size_t n = q.consume_bulk([&](int& v) noexcept {
+            CHECK(v == expect);
+            ++expect;
+        });
+        CHECK(n == 5);
+        CHECK(expect == 5);
+        CHECK(q.empty());
+        // One release store covered the whole run: the consumer index moved by 5.
+        CHECK(q.size() == 0);
+    }
+    // max_count truncates; the remainder stays for the next call.
+    {
+        zrqueue::SpscMirrorQueue<int, 8> q;
+        for (int i = 0; i < 6; ++i) {
+            q.emplace(i);
+        }
+        int expect = 0;
+        CHECK(q.consume_bulk([&](int& v) noexcept {
+                  CHECK(v == expect);
+                  ++expect;
+              }, 4) == 4);
+        CHECK(expect == 4);
+        CHECK(q.consume_bulk([&](int& v) noexcept {
+                  CHECK(v == expect);
+                  ++expect;
+              }) == 2);
+        CHECK(expect == 6);
+        CHECK(q.empty());
+    }
+    // Deep backlog: beyond the mirror window the slots are authoritative, and a
+    // wrapped ring (index > N) still yields values in order.
+    {
+        zrqueue::SpscMirrorQueue<int, 4> q;
+        int produced = 0;
+        for (int round = 0; round < 5; ++round) {
+            for (int i = 0; i < 4; ++i) {
+                q.emplace(produced + i);
+            }
+            produced += 4;
+            int expect = round * 4;
+            const size_t n = q.consume_bulk([&](int& v) noexcept {
+                CHECK(v == expect);
+                ++expect;
+            });
+            CHECK(n == 4);
+            CHECK(expect == round * 4 + 4);
+        }
+        CHECK(q.empty());
+    }
+    // Stale cached producer index: after a partial drain, cached_write_index_
+    // lags the real write_index_, so the mirror depth pre-filter is an
+    // UNDER-estimate for the remaining elements. Those must fall back to the
+    // authoritative slots and still yield the right values in order.
+    {
+        zrqueue::SpscMirrorQueue<int, 8> q;
+        for (int i = 0; i < 8; ++i) {
+            q.emplace(i);
+        }
+        int expect = 0;
+        CHECK(q.consume_bulk([&](int& v) noexcept {
+                  CHECK(v == expect);
+                  ++expect;
+              }, 2) == 2); // read=2, cached_write_index_ = 8
+        CHECK(expect == 2);
+        q.emplace(8);
+        q.emplace(9); // write=10; slots 0 and 1 were recycled by 8 and 9
+        // cached_write_index_ is still 8, so only indices 2..7 are known.
+        CHECK(q.consume_bulk([&](int& v) noexcept {
+                  CHECK(v == expect);
+                  ++expect;
+              }) == 6);
+        CHECK(expect == 8);
+        // The next call refreshes the cached index and sees 8 and 9.
+        CHECK(q.consume_bulk([&](int& v) noexcept {
+                  CHECK(v == expect);
+                  ++expect;
+              }) == 2);
+        CHECK(expect == 10);
+        CHECK(q.empty());
+    }
+
+    // 8 B scalar mirror (seqlock path) drains correctly.
+    {
+        zrqueue::SpscMirrorQueue<uint64_t, 8> q;
+        for (uint64_t i = 0; i < 6; ++i) {
+            q.emplace(i * 0x0101010101010101ULL);
+        }
+        uint64_t expect = 0;
+        CHECK(q.consume_bulk([&](uint64_t& v) noexcept {
+                  CHECK(v == expect);
+                  expect += 0x0101010101010101ULL;
+              }) == 6);
+        CHECK(q.empty());
+    }
+    // Non-trivial T: every element is destructed exactly once, including the ones
+    // the handler observed through the mirror stash.
+    {
+        zrqueue::SpscMirrorQueue<PayloadBig, 4> q;
+        PayloadBig v;
+        v.fill(3);
+        for (int i = 0; i < 3; ++i) {
+            q.emplace(v);
+        }
+        size_t seen = 0;
+        CHECK(q.consume_bulk([&](PayloadBig& p) noexcept {
+                  CHECK(p.check(3));
+                  ++seen;
+              }) == 3);
+        CHECK(seen == 3);
+        CHECK(q.empty());
+    }
+}
+
+void testMirrorPushBulk() {
+    // Basic: 5 elements in, 5 out, in order.
+    {
+        zrqueue::SpscMirrorQueue<int, 8> q;
+        const int src[] = { 10, 11, 12, 13, 14 };
+        CHECK(q.push_bulk(src, 5) == 5);
+        for (int i = 0; i < 5; ++i) {
+            int* f = q.front();
+            CHECK(f != nullptr);
+            if (f) {
+                CHECK(*f == 10 + i);
+            }
+            q.pop();
+        }
+        CHECK(q.empty());
+    }
+    // count == 0 is a no-op.
+    {
+        zrqueue::SpscMirrorQueue<int, 8> q;
+        const int src[] = { 1 };
+        CHECK(q.push_bulk(src, 0) == 0);
+        CHECK(q.empty());
+    }
+    // Partial push: only the free slots are written, the rest is reported.
+    {
+        zrqueue::SpscMirrorQueue<int, 8> q;
+        const int src[] = { 0, 1, 2, 3, 4, 5, 6, 7, 8, 9 };
+        CHECK(q.push_bulk(src, 8) == 8);
+        CHECK(q.push_bulk(src, 4) == 0); // full
+        CHECK(q.consume_bulk([](int&) noexcept {}) == 8);
+        CHECK(q.push_bulk(src, 10) == 8); // capacity is 8
+        int expect = 0;
+        CHECK(q.consume_bulk([&](int& v) noexcept {
+                  CHECK(v == expect);
+                  ++expect;
+              }) == 8);
+        CHECK(expect == 8);
+    }
+    // A run longer than the mirror window still drains correctly: elements past
+    // the window are served from their slots.
+    {
+        zrqueue::SpscMirrorQueue<int, 16> q;
+        const int src[] = { 0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11 };
+        CHECK(q.push_bulk(src, 12) == 12);
+        int expect = 0;
+        CHECK(q.consume_bulk([&](int& v) noexcept {
+                  CHECK(v == expect);
+                  ++expect;
+              }) == 12);
+        CHECK(expect == 12);
+        CHECK(q.empty());
+    }
+    // The trailing K elements are readable through the mirror: after a bulk push
+    // of exactly K, front() must serve from the consumer-local stash.
+    {
+        zrqueue::SpscMirrorQueue<int, 8> q;
+        const int src[] = { 7, 8, 9, 10 };
+        CHECK(q.push_bulk(src, 4) == 4); // 4 B mirror window is K = 4
+        CHECK(q.front() != q.peek(0));   // mirror hit: stash, not the slot
+        CHECK(*q.front() == 7);
+        q.pop();
+        CHECK(q.empty() == false);
+    }
+    // 8 B seqlock mirror path.
+    {
+        zrqueue::SpscMirrorQueue<uint64_t, 8> q;
+        const uint64_t src[] = { 0x1111, 0x2222, 0x3333 };
+        CHECK(q.push_bulk(src, 3) == 3);
+        for (int i = 0; i < 3; ++i) {
+            uint64_t* f = q.front();
+            CHECK(f != nullptr);
+            if (f) {
+                CHECK(*f == src[i]);
+            }
+            q.pop();
+        }
+        CHECK(q.empty());
+    }
+    // Non-mirrored type: bulk push still works, no entries are consulted.
+    {
+        zrqueue::SpscMirrorQueue<MirrorOptOut4, 8> q;
+        MirrorOptOut4 src[3];
+        src[0].v = 1; src[1].v = 2; src[2].v = 3;
+        CHECK(q.push_bulk(src, 3) == 3);
+        for (uint32_t i = 0; i < 3; ++i) {
+            MirrorOptOut4* f = q.front();
+            CHECK(f != nullptr);
+            if (f) {
+                CHECK(f->v == i + 1);
+            }
+            q.pop();
+        }
+        CHECK(q.empty());
+    }
+    // Wrapped ring: a second bulk push lands across the wrap point and still
+    // reads back in order.
+    {
+        zrqueue::SpscMirrorQueue<int, 4> q;
+        const int a[] = { 0, 1, 2 };
+        CHECK(q.push_bulk(a, 3) == 3);
+        CHECK(q.consume_bulk([](int&) noexcept {}) == 3);
+        const int b[] = { 3, 4, 5, 6 };
+        CHECK(q.push_bulk(b, 4) == 4);
+        int expect = 3;
+        CHECK(q.consume_bulk([&](int& v) noexcept {
+                  CHECK(v == expect);
+                  ++expect;
+              }) == 4);
+        CHECK(expect == 7);
+        CHECK(q.empty());
+    }
+}
+
+void testRingValuePush() {
+    {
+        zrqueue::SpscRingBuffer<int, 8> q;
+        for (int i = 0; i < 6; ++i) {
+            q.push_value(i);
+        }
+        for (int i = 0; i < 6; ++i) {
+            int* f = q.front();
+            CHECK(f != nullptr);
+            if (f) {
+                CHECK(*f == i);
+            }
+            q.pop();
+        }
+        CHECK(q.empty());
+        for (int i = 0; i < 8; ++i) {
+            CHECK(q.try_push_value(i));
+        }
+        CHECK(!q.try_push_value(99));
+        for (int i = 0; i < 8; ++i) {
+            int* f = q.front();
+            CHECK(f != nullptr);
+            if (f) {
+                CHECK(*f == i);
+            }
+            q.pop();
+        }
+        CHECK(q.empty());
+        q.push_value(42);
+        CHECK(*q.front() == 42);
+        q.pop();
+        CHECK(q.empty());
+    }
+    {
+        // Multi-cache-line value path exercises spin_alloc().
+        zrqueue::SpscRingBuffer<PayloadBig, 4> q;
+        PayloadBig v;
+        v.fill(7);
+        q.push_value(v);
+        PayloadBig* f = q.front();
+        CHECK(f != nullptr);
+        if (f) {
+            CHECK(f->check(7));
+        }
+        q.pop();
+        CHECK(q.empty());
+    }
+}
+
 void testDeathCases(const char* self) {
     static const char* cases[] = {
         "double_alloc", "double_spin_alloc", "bulk_then_push",
@@ -773,15 +1278,26 @@ int main(int argc, char* argv[]) {
     testAllModels<int, 8>("int");
     testAllModels<PayloadBig, 8>("256B");
     testAllModels<PayloadNonPod, 8>("non-POD");
+    testAllModels<PayloadScalar8, 8>("8B scalar");
+    testAllModels<PayloadTwo32, 8>("8B two32");
+    testAllModels<PayloadNarrow4, 8>("4B narrow");
 
     testBoundaries<int, 8>();
     testBoundaries<int, 2>();
     testBoundaries<PayloadBig, 8>();
     testBoundaries<PayloadNonPod, 8>();
+    testBoundaries<PayloadScalar8, 8>();
+    testBoundaries<PayloadScalar8, 2>();
+    testBoundaries<PayloadTwo32, 8>();
+    testBoundaries<PayloadTwo32, 2>();
+    testBoundaries<PayloadNarrow4, 8>();
+    testBoundaries<PayloadNarrow4, 2>();
 
     testPeekOverflow<int, 8>();
     testPeekOverflow<int, 2>();
     testPeekOverflow<PayloadNonPod, 8>();
+    testPeekOverflow<PayloadScalar8, 8>();
+    testPeekOverflow<PayloadTwo32, 8>();
 
     testFrontBulk<int, 8>();
     testFrontBulk<int, 2>();
@@ -792,6 +1308,18 @@ int main(int argc, char* argv[]) {
     testBulk();
     testNonPodLifetime();
     testClaimCommit();
+    testMirrorPackedApi();
+    testMirrorHitPath<int>();
+    testMirrorHitPath<uint64_t>();
+    testMirrorHitPath<PayloadScalar8>();
+    testMirrorHitPath<PayloadTwo32>();
+    testMirrorHitPath<PayloadNarrow4>();
+    testMirrorDisabledPath<MirrorOptOut4>();
+    testMirrorDisabledPath<MirrorDefault8>();
+    testMirrorPolicyFallback();
+    testRingValuePush();
+    testMirrorConsumeBulk();
+    testMirrorPushBulk();
     testRingPushLargePayload();
     if (runDeath) {
         testDeathCases(argv[0]);

@@ -49,7 +49,7 @@ SOFTWARE.
     #error "zrqueue requires if constexpr (__cpp_if_constexpr missing)"
 #endif
 
-#define ZRQUEUE_VERSION 10902   //1.9.2
+#define ZRQUEUE_VERSION 11000   //1.10.0
 
 #include <atomic>
 #include <array>
@@ -1196,6 +1196,34 @@ namespace zrqueue {
             }
         }
 
+        // Direct value API for pre-constructed slots. The caller already owns a
+        // value, so no writer lambda claim/write/commit triple is needed: one
+        // alloc(), one assignment into the slot, one release store. This is the
+        // small-payload fast path; for in-place construction use push(Writer).
+        template <typename P, typename = std::enable_if_t<std::is_assignable_v<T&, P&&>>>
+        ZRQUEUE_NODISCARD ZRQUEUE_FORCE_INLINE bool try_push_value(P&& v) noexcept(std::is_nothrow_assignable_v<T&, P&&>) {
+            T* slot = alloc();
+            if (ZRQUEUE_LIKELY(slot != nullptr)) {
+                *slot = std::forward<P>(v);
+                push();
+                return true;
+            }
+            return false;
+        }
+
+        template <typename P, typename = std::enable_if_t<std::is_assignable_v<T&, P&&>>>
+        ZRQUEUE_FORCE_INLINE void push_value(P&& v) noexcept(std::is_nothrow_assignable_v<T&, P&&>) {
+            if constexpr (sizeof(T) > ZRQUEUE_CACHE_LINE_SIZE) {
+                T* slot = spin_alloc();
+                *slot = std::forward<P>(v);
+                push();
+            } else {
+                while (!try_push_value(std::forward<P>(v))) {
+                    ZRQUEUE_CPU_PAUSE();
+                }
+            }
+        }
+
         ZRQUEUE_NODISCARD ZRQUEUE_FORCE_INLINE T* front() noexcept {
             const uint64_t read_index = read_index_.load(std::memory_order_relaxed);
             if (ZRQUEUE_UNLIKELY(read_index == cached_write_index_)) {
@@ -1377,35 +1405,104 @@ namespace zrqueue {
     };  // end SpscRingBuffer
 
     // ============================================================================
+    // [Mirror Policy Customization Points]
+    // ============================================================================
+    // SpscMirrorQueue mirrors a payload into the producer's index cache line so
+    // the consumer's acquire-load of write_index_ delivers index + payload in a
+    // single cross-core line migration. Two payload widths are supported:
+    //
+    //   sizeof(T) <= 4  entry = {seq32 | payload32} (8 B), K = 4
+    //   sizeof(T) == 8  entry = {seq64, payload64} (16 B), K = 2, seqlock
+    //
+    // mirror_traits<T> is a compile-time policy. Defaults:
+    //   - 4 B: mirror enabled for every trivially-copyable type of size 4 or less;
+    //   - 8 B: mirror enabled only for arithmetic scalars (uint64_t, int64_t,
+    //          double, ...). Custom 8 B structs fall back to the classic path
+    //          unless they opt in.
+    // The 8 B seqlock writes two 8 B words into the index line, so it trades
+    // roughly 20% saturated throughput for roughly 20% lower RTT. Disable it
+    // for a throughput-only queue by specializing mirror_traits<T>::enable_8b
+    // to false (the 4 B path and classic protocol are unaffected).
+    // Specialize BOTH flags (an explicit specialization does not inherit the
+    // primary template's defaults):
+    //
+    //   template <> struct zrqueue::mirror_traits<MyTick8> {
+    //       static constexpr bool enable_4b = false;
+    //       static constexpr bool enable_8b = true;
+    //   };
+    //
+    // mirror_codec<T> is an optional second customization point. If a
+    // specialization provides `static <payload_type> pack(Arg&...)`, emplace()
+    // packs the mirror payload from the construction arguments instead of
+    // reading the constructed object back out of its slot. Use it for types
+    // whose constructor emits several narrow stores (byte/field fills): reading
+    // such an object back defeats store-to-load forwarding and collapses
+    // throughput. The codec must be noexcept and must not move from its
+    // arguments; it receives lvalue references and runs before the slot is
+    // constructed.
+    template <typename T>
+    struct mirror_traits {
+        static constexpr bool enable_4b = true;
+        static constexpr bool enable_8b = std::is_arithmetic_v<T>;
+    };
+
+    template <typename T>
+    using mirror_payload_t = std::conditional_t<(sizeof(T) <= 4), uint32_t, uint64_t>;
+
+    template <typename T>
+    struct mirror_codec {
+        // Primary template intentionally has no pack(); detection below falls
+        // back to the authoritative slot read-back.
+    };
+
+    namespace mirror_detail {
+        template <typename T, typename... Args>
+        struct has_codec {
+        private:
+            template <typename U, typename = decltype(mirror_codec<U>::pack(std::declval<Args&>()...))>
+            static std::true_type test(int);
+            template <typename U> static std::false_type test(...);
+        public:
+            static constexpr bool value = decltype(test<T>(0))::value;
+        };
+    } // namespace mirror_detail
+
+    // ============================================================================
     // [Latency-Optimized Lock-Free Queue SpscMirrorQueue (Latest-K Element Mirroring)]
     // ============================================================================
-    // Idea: in classic SPSC (the three queues above), delivering a near-empty-queue
-    // element costs TWO cross-core cache-line migrations: the index line
-    // (write_index_) and the data line (the slot). Here the producer additionally
-    // packs every pushed element - for sizeof(T) <= 4 - into an 8-byte atomic entry
-    // {seq:u32 | payload:u32} living in its OWN index line (the line the consumer's
-    // polling load fetches anyway). The consumer's acquire-load of write_index_
-    // returns the index AND brings the payload along; the entry is then read as a
-    // plain L1 hit, atomically - no torn reads, no re-validation.
+    // Idea: in classic SPSC, delivering a near-empty-queue element costs TWO
+    // cross-core cache-line migrations: the index line (write_index_) and the
+    // data line (the slot). Here the producer additionally packs every pushed
+    // element into an atomic entry living in its OWN index line (the line the
+    // consumer's polling load fetches anyway). The consumer's acquire-load of
+    // write_index_ returns the index AND brings the payload along; the entry is
+    // then read as a plain L1 hit, atomically - no torn reads, no re-validation.
     // Ping-pong round-trip: 4 line migrations -> 2 (~40% lower RTT, measured).
     //
     // Safety: availability is still detected via the monotonic write_index_ (never
-    // missed, even if the producer laps the 4-entry mirror ring). The entry for
-    // element r is only overwritten by element r+K, whose store happens-before
-    // write_index_ reaches r+K+1; the consumer gates the fast path on depth <= K
-    // and double-checks entry.seq == r, falling back to the packed slots otherwise.
-    // Slots always hold authoritative data (the classic protocol is fully
-    // preserved), so pop() always destructs the slot, mirror hit or not.
+    // missed, even if the producer laps the mirror ring). An entry for element r
+    // is only overwritten by element r+K, whose store happens-before write_index_
+    // reaches r+K+1; the consumer gates the fast path on depth <= K, double-checks
+    // the entry (seq for 4 B, seq/payload/seq for 8 B), and falls back to the
+    // packed slots otherwise. Slots always hold authoritative data (the classic
+    // protocol is fully preserved), so pop() always destructs the slot.
+    //
+    // The 8 B entry uses a seqlock: producer stores seq, then payload (release),
+    // then write_index_ (release); consumer loads seq, payload (acquire), then
+    // seq again. A concurrent overwrite either changes the first seq (miss) or,
+    // if the payload load observes the newer value, the payload release/acquire
+    // pair makes the newer seq visible to the second load (miss as well).
     //
     // Deep-backlog throughput path is untouched: packed slots, cached remote
-    // indices, one release store per push. The mirror adds exactly one extra store
-    // to the producer's OWN line per push (~1 cycle), and in shallow flow REMOVES
-    // the data-line migration classic SPSC pays per element.
+    // indices, one release store per push. The mirror adds one or two stores to
+    // the producer's OWN line per push, and in shallow flow REMOVES the data-line
+    // migration classic SPSC pays per element.
     //
-    // Mirror is enabled only for trivially-copyable T with sizeof(T) <= 4 (K = 4
-    // packed 8-byte entries fit the 48B left in the index line; power-of-2 K so
-    // ring indexing is a mask). Larger/non-copyable types transparently fall back
-    // to the classic path with identical semantics.
+    // Payload extraction is the one place where the mirror can lose: reading a
+    // just-constructed object back from its slot stalls when the constructor
+    // emitted narrow (byte/field) stores. emplace_packed()/push_packed() let the
+    // caller supply the payload explicitly, and mirror_codec<T> lets a type
+    // provide it from the constructor arguments without changing call sites.
     //
     // Deliberately minimal API (RTT-focused): no bulk ops - use SpscRingBuffer or
     // SpscInlineQueue for burst workloads.
@@ -1416,18 +1513,42 @@ namespace zrqueue {
 
         static constexpr uint32_t MASK = N - 1;
 
-        static constexpr bool MIRROR_OK =
-            std::is_trivially_copyable_v<T> && sizeof(T) <= 4 && alignof(T) <= 8;
-        static constexpr size_t MIRROR_K = MIRROR_OK ? 4 : 0;
+        static constexpr bool MIRROR_4 =
+            std::is_trivially_copyable_v<T> && sizeof(T) <= 4 && alignof(T) <= 8 &&
+            mirror_traits<T>::enable_4b;
+        static constexpr bool MIRROR_8 =
+            std::is_trivially_copyable_v<T> && sizeof(T) == 8 && alignof(T) <= 8 &&
+            mirror_traits<T>::enable_8b;
+        static constexpr bool MIRROR_OK = MIRROR_4 || MIRROR_8;
+        static constexpr size_t MIRROR_K = MIRROR_8 ? 2 : (MIRROR_4 ? 4 : 1);
         static constexpr size_t MIRROR_MASK = MIRROR_K - 1;
-        static constexpr uint64_t EMPTY_ENTRY = 0xFFFFFFFF00000000ULL; // seq = UINT32_MAX, never matches
+        static constexpr uint64_t EMPTY_ENTRY_4B = 0xFFFFFFFF00000000ULL; // seq = UINT32_MAX
+
+        struct MirrorEntry8 {
+            std::atomic<uint64_t> seq;
+            std::atomic<uint64_t> payload;
+            MirrorEntry8() noexcept : seq(0), payload(0) {}
+        };
+        using MirrorEntry = std::conditional_t<MIRROR_8, MirrorEntry8, std::atomic<uint64_t>>;
+        using MirrorStash = std::conditional_t<MIRROR_OK, T, std::byte>;
 
     public:
+        using payload_type = mirror_payload_t<T>;
+        static constexpr bool mirror_enabled = MIRROR_OK;
+        static constexpr size_t mirror_window = MIRROR_OK ? MIRROR_K : 0;
+
         SpscMirrorQueue() noexcept {
-            if constexpr (MIRROR_OK) {
+            if constexpr (MIRROR_4) {
                 for (size_t i = 0; i < MIRROR_K; ++i) {
-                    mirror_entries_[i].store(EMPTY_ENTRY, std::memory_order_relaxed);
+                    mirror_entries_[i].store(EMPTY_ENTRY_4B, std::memory_order_relaxed);
                 }
+            } else if constexpr (MIRROR_8) {
+                for (size_t i = 0; i < MIRROR_K; ++i) {
+                    mirror_entries_[i].seq.store(~static_cast<uint64_t>(0), std::memory_order_relaxed);
+                    mirror_entries_[i].payload.store(0, std::memory_order_relaxed);
+                }
+            } else {
+                mirror_entries_[0].store(0, std::memory_order_relaxed);
             }
             // [Core Defense]: Pre-fault every OS page of the slot array at startup so the
             // live phase never pays first-touch page-fault spikes (~1-5us each). This
@@ -1468,8 +1589,19 @@ namespace zrqueue {
             }
 
             T* slot = slot_at(write_index);
-            new (slot) T(std::forward<Args>(args)...);
-            mirror(write_index, slot); // packed store into own line, ordered before the release below
+            if constexpr (MIRROR_OK) {
+                if constexpr (mirror_detail::has_codec<T, Args...>::value) {
+                    const payload_type payload =
+                        static_cast<payload_type>(mirror_codec<T>::pack(args...));
+                    new (slot) T(std::forward<Args>(args)...);
+                    mirror_store(write_index, payload);
+                } else {
+                    new (slot) T(std::forward<Args>(args)...);
+                    mirror_from_slot(write_index, slot);
+                }
+            } else {
+                new (slot) T(std::forward<Args>(args)...);
+            }
             write_index_.store(next_write_index, std::memory_order_release);
         }
 
@@ -1487,8 +1619,63 @@ namespace zrqueue {
             }
 
             T* slot = slot_at(write_index);
-            new (slot) T(std::forward<Args>(args)...);
-            mirror(write_index, slot);
+            if constexpr (MIRROR_OK) {
+                if constexpr (mirror_detail::has_codec<T, Args...>::value) {
+                    const payload_type payload =
+                        static_cast<payload_type>(mirror_codec<T>::pack(args...));
+                    new (slot) T(std::forward<Args>(args)...);
+                    mirror_store(write_index, payload);
+                } else {
+                    new (slot) T(std::forward<Args>(args)...);
+                    mirror_from_slot(write_index, slot);
+                }
+            } else {
+                new (slot) T(std::forward<Args>(args)...);
+            }
+            write_index_.store(next_write_index, std::memory_order_release);
+            return true;
+        }
+
+        // --------------------------------------------------------------------
+        // Explicit payload API. The caller supplies the object representation of
+        // the constructed T, so publication never depends on reading the slot
+        // back. Required for custom types whose constructor emits narrow stores;
+        // otherwise the mirror read-back can cost 3-7x throughput.
+        // Contract: payload must equal the byte representation of T(args...).
+        // --------------------------------------------------------------------
+        template <typename... Args>
+        ZRQUEUE_FORCE_INLINE void emplace_packed(payload_type payload, Args&&... args) noexcept(std::is_nothrow_constructible_v<T, Args&&...>) {
+            static_assert(MIRROR_OK, "emplace_packed requires a mirror-eligible T (see mirror_traits)");
+            static_assert(std::is_constructible_v<T, Args&&...>, "T must be constructible with Args&&...");
+            const uint64_t write_index = write_index_.load(std::memory_order_relaxed);
+            const uint64_t next_write_index = write_index + 1;
+
+            while (ZRQUEUE_UNLIKELY(next_write_index - cached_read_index_ > N)) {
+                cached_read_index_ = read_index_.load(std::memory_order_acquire);
+                ZRQUEUE_CPU_PAUSE();
+            }
+
+            new (slot_at(write_index)) T(std::forward<Args>(args)...);
+            mirror_store(write_index, payload);
+            write_index_.store(next_write_index, std::memory_order_release);
+        }
+
+        template <typename... Args>
+        ZRQUEUE_NODISCARD ZRQUEUE_FORCE_INLINE bool try_emplace_packed(payload_type payload, Args&&... args) noexcept(std::is_nothrow_constructible_v<T, Args&&...>) {
+            static_assert(MIRROR_OK, "try_emplace_packed requires a mirror-eligible T (see mirror_traits)");
+            static_assert(std::is_constructible_v<T, Args&&...>, "T must be constructible with Args&&...");
+            const uint64_t write_index = write_index_.load(std::memory_order_relaxed);
+            const uint64_t next_write_index = write_index + 1;
+
+            if (ZRQUEUE_UNLIKELY(next_write_index - cached_read_index_ > N)) {
+                cached_read_index_ = read_index_.load(std::memory_order_acquire);
+                if (ZRQUEUE_UNLIKELY(next_write_index - cached_read_index_ > N)) {
+                    return false;
+                }
+            }
+
+            new (slot_at(write_index)) T(std::forward<Args>(args)...);
+            mirror_store(write_index, payload);
             write_index_.store(next_write_index, std::memory_order_release);
             return true;
         }
@@ -1511,6 +1698,79 @@ namespace zrqueue {
             return try_emplace(std::forward<P>(v));
         }
 
+        ZRQUEUE_FORCE_INLINE void push_packed(payload_type payload, const T& v) noexcept(std::is_nothrow_copy_constructible_v<T>) {
+            emplace_packed(payload, v);
+        }
+
+        template <typename P, typename = std::enable_if_t<std::is_constructible_v<T, P&&>>>
+        ZRQUEUE_FORCE_INLINE void push_packed(payload_type payload, P&& v) noexcept(std::is_nothrow_constructible_v<T, P&&>) {
+            emplace_packed(payload, std::forward<P>(v));
+        }
+
+        ZRQUEUE_NODISCARD ZRQUEUE_FORCE_INLINE bool try_push_packed(payload_type payload, const T& v) noexcept(std::is_nothrow_copy_constructible_v<T>) {
+            return try_emplace_packed(payload, v);
+        }
+
+        template <typename P, typename = std::enable_if_t<std::is_constructible_v<T, P&&>>>
+        ZRQUEUE_NODISCARD ZRQUEUE_FORCE_INLINE bool try_push_packed(payload_type payload, P&& v) noexcept(std::is_nothrow_constructible_v<T, P&&>) {
+            return try_emplace_packed(payload, std::forward<P>(v));
+        }
+
+        // ------------------------------------------------------------------------
+        // Bulk Push: construct up to `count` elements from an iterator and publish
+        // them with ONE release store instead of one per element. Returns the
+        // number actually written (partial push when the queue cannot fit the
+        // whole run; 0 when full). Same signature and contract as
+        // SpscHeapQueue::push_bulk / SpscInlineQueue::push_bulk.
+        //
+        // Mirror behaviour: entries are written only for elements that stay inside
+        // the K-element window (the last K of the run). The consumer can only use
+        // an entry when the backlog is <= K, which is exactly when the newest
+        // elements are the ones being read. Earlier elements fall back to their
+        // slots, which are authoritative anyway. Skipping those mirror stores is
+        // not a micro-optimisation: a mirror entry for element i is overwritten by
+        // element i+K, so a run longer than K would write K entries twice for no
+        // benefit. Measured cost of the whole bulk path versus a per-element
+        // emplace loop: none (see README) - the gain is API parity, not speed.
+        // ------------------------------------------------------------------------
+        template <typename Iterator>
+        ZRQUEUE_NODISCARD size_t push_bulk(Iterator first, size_t count) noexcept {
+            static_assert(std::is_nothrow_constructible_v<T, decltype(*first)>,
+                          "push_bulk is noexcept: T must be nothrow-constructible from the iterator's value");
+            if (ZRQUEUE_UNLIKELY(count == 0)) {
+                return 0;
+            }
+            const uint64_t write_index = write_index_.load(std::memory_order_relaxed);
+            uint64_t next_write_index = write_index + count;
+
+            if (ZRQUEUE_UNLIKELY(next_write_index - cached_read_index_ > N)) {
+                cached_read_index_ = read_index_.load(std::memory_order_acquire);
+                if (ZRQUEUE_UNLIKELY(next_write_index - cached_read_index_ > N)) {
+                    count = static_cast<size_t>(N - (write_index - cached_read_index_));
+                    if (ZRQUEUE_UNLIKELY(count == 0)) {
+                        return 0; // Queue is totally full
+                    }
+                    next_write_index = write_index + count;
+                }
+            }
+
+            // Sequential placement new, no atomic traffic until the final store.
+            for (size_t i = 0; i < count; ++i) {
+                new (slot_at(write_index + i)) T(*first++);
+            }
+
+            if constexpr (MIRROR_OK) {
+                // Only the trailing window can still be read through the mirror.
+                const size_t mirrored = count < MIRROR_K ? count : MIRROR_K;
+                for (size_t i = count - mirrored; i < count; ++i) {
+                    mirror_from_slot(write_index + i, slot_at(write_index + i));
+                }
+            }
+
+            write_index_.store(next_write_index, std::memory_order_release);
+            return count;
+        }
+
         ZRQUEUE_NODISCARD ZRQUEUE_FORCE_INLINE T* front() noexcept {
             const uint64_t read_index = read_index_.load(std::memory_order_relaxed);
             if (ZRQUEUE_LIKELY(read_index != cached_write_index_)) {
@@ -1521,8 +1781,10 @@ namespace zrqueue {
                 return nullptr;
             }
             cached_write_index_ = w1;
-            if (T* m = try_mirror(read_index, w1)) {
-                return m;
+            if constexpr (MIRROR_OK) {
+                if (T* m = try_mirror(read_index, w1)) {
+                    return m;
+                }
             }
             return slot_at(read_index);
         }
@@ -1536,8 +1798,10 @@ namespace zrqueue {
                 const uint64_t w1 = write_index_.load(std::memory_order_acquire);
                 if (ZRQUEUE_LIKELY(read_index != w1)) {
                     cached_write_index_ = w1;
-                    if (T* m = try_mirror(read_index, w1)) {
-                        return m;
+                    if constexpr (MIRROR_OK) {
+                        if (T* m = try_mirror(read_index, w1)) {
+                            return m;
+                        }
                     }
                     return slot_at(read_index);
                 }
@@ -1552,6 +1816,79 @@ namespace zrqueue {
                 slot_at(read_index)->~T(); // slot always holds a constructed element, mirror or not
             }
             read_index_.store(read_index + 1, std::memory_order_release);
+        }
+
+        // ------------------------------------------------------------------------
+        // Bulk Zero-Copy Consume: drain up to max_count (0 = everything published)
+        // with ONE release store for the whole run, instead of one per element.
+        //
+        // Unlike SpscHeapQueue/SpscInlineQueue/SpscRingBuffer there is no
+        // front_bulk(): those hand back a pointer into a contiguous slot array,
+        // while here a mirror hit unpacks into the single-element mirror_stash_ and
+        // a run can mix mirror hits with slot fallbacks, so no contiguous run
+        // exists to return. The handler therefore receives one T& at a time, which
+        // still costs no copy for non-mirrored elements.
+        //
+        // The mirror fast path is used per element when eligible. Safety is the
+        // same as front(): the entry's seq must equal the element's index, so an
+        // entry already overwritten by a later lap misses and falls back to the
+        // authoritative slot. cached_write_index_ is an acquire-loaded past value
+        // of write_index_, so the depth pre-filter can only under-estimate the
+        // backlog; an under-estimate is still safe because the seq check decides.
+        //
+        // Handler and T must be nothrow: the indices are published with a single
+        // release store after the loop, so a throw would strand a partially
+        // consumed run.
+        // ------------------------------------------------------------------------
+        template <typename THandler>
+        ZRQUEUE_NODISCARD size_t consume_bulk(THandler&& handler, size_t max_count = 0) noexcept {
+            static_assert(std::is_nothrow_destructible_v<T>, "T must be nothrow destructible");
+            static_assert(std::is_nothrow_invocable_v<THandler, T&>,
+                          "consume_bulk is noexcept: handler must be nothrow-invocable with T&");
+            const uint64_t read_index = read_index_.load(std::memory_order_relaxed);
+
+            if (ZRQUEUE_UNLIKELY(read_index == cached_write_index_)) {
+                cached_write_index_ = write_index_.load(std::memory_order_acquire);
+                if (ZRQUEUE_UNLIKELY(read_index == cached_write_index_)) {
+                    return 0; // Queue is empty
+                }
+            }
+
+            const uint64_t available = cached_write_index_ - read_index;
+            const size_t count = (max_count == 0 || max_count > available)
+                                     ? static_cast<size_t>(available)
+                                     : max_count;
+
+            // Mirror entries are only meaningful while the whole run fits the
+            // window: entry i is overwritten once the producer is more than
+            // MIRROR_K elements ahead, and a burst drain usually is. Skipping the
+            // per-element mirror probe in that case is what keeps this loop at
+            // parity with the manual front()/pop() drain (a probe that must miss
+            // is pure overhead - measured 16% slower without this guard).
+            const bool probe_mirror = MIRROR_OK && available <= MIRROR_K;
+
+            for (size_t i = 0; i < count; ++i) {
+                const uint64_t index = read_index + i;
+                T* elem = nullptr;
+                if constexpr (MIRROR_OK) {
+                    if (probe_mirror) {
+                        elem = try_mirror(index, cached_write_index_);
+                    }
+                }
+                if (elem == nullptr) {
+                    elem = slot_at(index);
+                }
+                std::forward<THandler>(handler)(*elem); // zero-copy: reference, not a copy
+
+                if constexpr (!std::is_trivially_destructible_v<T>) {
+                    // The slot is authoritative and always constructed, so it is
+                    // destructed even when the handler saw the mirror stash.
+                    slot_at(index)->~T();
+                }
+            }
+
+            read_index_.store(read_index + count, std::memory_order_release);
+            return count;
         }
 
         // Reads the authoritative slot directly (mirroring is a front()-path
@@ -1594,30 +1931,61 @@ namespace zrqueue {
             return &reinterpret_cast<T*>(slots_)[index & MASK];
         }
 
-        // Producer: pack {seq32 | payload32} into the mirror entry (own line, one store).
-        ZRQUEUE_FORCE_INLINE void mirror(uint64_t write_index, const T* slot) noexcept {
-            if constexpr (MIRROR_OK) {
-                uint32_t lo = 0;
-                std::memcpy(&lo, slot, sizeof(T));
+        // Producer: pack a caller-supplied payload into the mirror entry.
+        ZRQUEUE_FORCE_INLINE void mirror_store(uint64_t write_index, payload_type payload) noexcept {
+            if constexpr (MIRROR_4) {
                 mirror_entries_[write_index & MIRROR_MASK].store(
-                    (static_cast<uint64_t>(static_cast<uint32_t>(write_index)) << 32) | lo,
+                    (static_cast<uint64_t>(static_cast<uint32_t>(write_index)) << 32) | payload,
                     std::memory_order_relaxed);
+            } else if constexpr (MIRROR_8) {
+                MirrorEntry8& e = mirror_entries_[write_index & MIRROR_MASK];
+                e.seq.store(write_index, std::memory_order_relaxed);
+                e.payload.store(payload, std::memory_order_release);
+            } else {
+                (void)write_index;
+                (void)payload;
             }
         }
 
-        // Consumer: single atomic load of the mirror entry - seq and payload arrive
-        // together, torn reads impossible, no re-validation needed. The entry rides the
-        // same cache line as write_index_, so after the acquire-load above this is an
-        // L1 hit. The unpacked element is stashed on the consumer's OWN line, so the
-        // fast path never touches any other shared state.
+        // Producer default path: read the just-constructed element back out of its
+        // slot. Cheap for single-store constructors, costly for narrow stores.
+        ZRQUEUE_FORCE_INLINE void mirror_from_slot(uint64_t write_index, const T* slot) noexcept {
+            if constexpr (MIRROR_4) {
+                uint32_t lo = 0;
+                std::memcpy(&lo, slot, sizeof(T));
+                mirror_store(write_index, lo);
+            } else if constexpr (MIRROR_8) {
+                uint64_t payload = 0;
+                std::memcpy(&payload, slot, sizeof(T));
+                mirror_store(write_index, payload);
+            }
+        }
+
+        // Consumer: one atomic load of the mirror entry - seq and payload arrive
+        // together. The entry rides the same cache line as write_index_, so after
+        // the acquire-load above this is an L1 hit. The unpacked element is
+        // stashed on the consumer's OWN line, so the fast path never touches any
+        // other shared state.
         ZRQUEUE_FORCE_INLINE T* try_mirror(uint64_t read_index, uint64_t w1) noexcept {
-            if constexpr (MIRROR_OK) {
+            if constexpr (MIRROR_4) {
                 if (w1 - read_index <= MIRROR_K) {
                     const uint64_t e = mirror_entries_[read_index & MIRROR_MASK].load(std::memory_order_relaxed);
                     if (ZRQUEUE_LIKELY(static_cast<uint32_t>(e >> 32) == static_cast<uint32_t>(read_index))) {
                         const uint32_t lo = static_cast<uint32_t>(e);
                         std::memcpy(&mirror_stash_, &lo, sizeof(T));
                         return &mirror_stash_;
+                    }
+                }
+            } else if constexpr (MIRROR_8) {
+                if (w1 - read_index <= MIRROR_K) {
+                    const MirrorEntry8& e = mirror_entries_[read_index & MIRROR_MASK];
+                    const uint64_t s1 = e.seq.load(std::memory_order_relaxed);
+                    if (ZRQUEUE_LIKELY(s1 == read_index)) {
+                        const uint64_t payload = e.payload.load(std::memory_order_acquire);
+                        if (ZRQUEUE_LIKELY(e.seq.load(std::memory_order_relaxed) == s1)) {
+                            std::memcpy(&mirror_stash_, &payload, sizeof(T));
+                            return &mirror_stash_;
+                        }
                     }
                 }
             }
@@ -1631,8 +1999,8 @@ namespace zrqueue {
         // bytes, never the consumer's read_index_ line.
         alignas(2 * ZRQUEUE_CACHE_LINE_SIZE) std::atomic<uint64_t> write_index_{ 0 };
         uint64_t cached_read_index_{ 0 };
-        std::atomic<uint64_t> mirror_entries_[MIRROR_OK ? MIRROR_K : 1];
-        static constexpr size_t PROD_LINE_USED = 16 + (MIRROR_OK ? MIRROR_K : 1) * 8;
+        MirrorEntry mirror_entries_[MIRROR_K];
+        static constexpr size_t PROD_LINE_USED = 16 + MIRROR_K * sizeof(MirrorEntry);
         static_assert(PROD_LINE_USED <= ZRQUEUE_CACHE_LINE_SIZE,
                       "mirror entries must fit the producer cache line");
         std::byte producer_tail_pad_[PROD_LINE_USED < ZRQUEUE_CACHE_LINE_SIZE
@@ -1640,12 +2008,12 @@ namespace zrqueue {
         std::byte producer_buddy_pad_[ZRQUEUE_CACHE_LINE_SIZE]; // prefetch buddy, never touched
 
         // [Cache Line PAIR 1: Consumer Zone]. mirror_stash_ lives on the consumer's own
-        // line so the unpack never touches shared state. Tail pad covers the rest of the
-        // consumer line plus the untouched prefetch buddy line.
+        // line so the unpack never touches shared state. Tail pad covers the rest of
+        // the consumer line plus the untouched prefetch buddy line.
         alignas(2 * ZRQUEUE_CACHE_LINE_SIZE) std::atomic<uint64_t> read_index_{ 0 };
         uint64_t cached_write_index_{ 0 };
-        alignas(T) T mirror_stash_{};
-        static constexpr size_t CONS_LINE_USED = 16 + sizeof(T);
+        alignas(MIRROR_OK ? alignof(T) : 1) MirrorStash mirror_stash_{};
+        static constexpr size_t CONS_LINE_USED = 16 + (MIRROR_OK ? sizeof(T) : 1);
         std::byte consumer_tail_pad_[CONS_LINE_USED < 2 * ZRQUEUE_CACHE_LINE_SIZE
                                        ? 2 * ZRQUEUE_CACHE_LINE_SIZE - CONS_LINE_USED : 1];
 

@@ -1,5 +1,7 @@
 #pragma once
 
+#include "../zrqueue.h"
+
 #include <array>
 #include <atomic>
 #include <cstddef>
@@ -82,3 +84,90 @@ struct PayloadSized<4> {
     PayloadSized(uint64_t s = 0) noexcept : seq(static_cast<uint32_t>(s)) {}
     void fill(uint64_t s) noexcept { seq = static_cast<uint32_t>(s); }
 };
+
+// ============================================================================
+// Mirror-path payloads
+// ============================================================================
+
+// 8 B scalar: one 8 B store, so the default mirror read-back forwards cheaply.
+struct PayloadScalar8 {
+    uint64_t seq;
+    PayloadScalar8(uint64_t s = 0) noexcept : seq(s) {}
+    void fill(uint64_t s) noexcept { seq = s; }
+};
+static_assert(sizeof(PayloadScalar8) == 8, "PayloadScalar8 must be 8 bytes");
+static_assert(std::is_trivially_copyable_v<PayloadScalar8>,
+              "PayloadScalar8 must be trivially copyable");
+
+// Same layout and constructor as PayloadScalar8, but the mirror is disabled at
+// compile time. Benchmarking the pair isolates the 8 B mirror's own cost/benefit.
+struct PayloadScalar8Classic {
+    uint64_t seq;
+    PayloadScalar8Classic(uint64_t s = 0) noexcept : seq(s) {}
+    void fill(uint64_t s) noexcept { seq = s; }
+};
+static_assert(sizeof(PayloadScalar8Classic) == 8, "PayloadScalar8Classic must be 8 bytes");
+static_assert(std::is_trivially_copyable_v<PayloadScalar8Classic>,
+              "PayloadScalar8Classic must be trivially copyable");
+
+// 8 B with a two-store constructor: the default mirror read-back defeats
+// store-to-load forwarding. Exercises emplace_packed()/push_packed().
+struct PayloadTwo32 {
+    uint32_t lo, hi;
+    PayloadTwo32(uint64_t s = 0) noexcept
+        : lo(static_cast<uint32_t>(s)), hi(static_cast<uint32_t>(s >> 32)) {}
+    void fill(uint64_t s) noexcept {
+        lo = static_cast<uint32_t>(s);
+        hi = static_cast<uint32_t>(s >> 32);
+    }
+    uint64_t bits() const noexcept { return (static_cast<uint64_t>(hi) << 32) | lo; }
+};
+static_assert(sizeof(PayloadTwo32) == 8, "PayloadTwo32 must be 8 bytes");
+static_assert(std::is_trivially_copyable_v<PayloadTwo32>,
+              "PayloadTwo32 must be trivially copyable");
+
+// 4 B with four byte stores: the same forwarding cliff on the 4 B path.
+// mirror_codec supplies the payload from the constructor argument, so
+// emplace(uint64_t) avoids the slot read-back.
+struct PayloadNarrow4 {
+    unsigned char a, b, c, d;
+    PayloadNarrow4(uint64_t s = 0) noexcept { fill(s); }
+    void fill(uint64_t s) noexcept {
+        a = static_cast<unsigned char>(s);
+        b = static_cast<unsigned char>(s >> 8);
+        c = static_cast<unsigned char>(s >> 16);
+        d = static_cast<unsigned char>(s >> 24);
+    }
+    uint32_t bits() const noexcept {
+        return static_cast<uint32_t>(a) | (static_cast<uint32_t>(b) << 8) |
+               (static_cast<uint32_t>(c) << 16) | (static_cast<uint32_t>(d) << 24);
+    }
+};
+static_assert(sizeof(PayloadNarrow4) == 4, "PayloadNarrow4 must be 4 bytes");
+static_assert(std::is_trivially_copyable_v<PayloadNarrow4>,
+              "PayloadNarrow4 must be trivially copyable");
+
+namespace zrqueue {
+template <>
+struct mirror_traits<PayloadScalar8> {
+    static constexpr bool enable_4b = false;
+    static constexpr bool enable_8b = true;
+};
+
+template <>
+struct mirror_traits<PayloadScalar8Classic> {
+    static constexpr bool enable_4b = false;
+    static constexpr bool enable_8b = false;
+};
+
+template <>
+struct mirror_traits<PayloadTwo32> {
+    static constexpr bool enable_4b = false;
+    static constexpr bool enable_8b = true;
+};
+
+template <>
+struct mirror_codec<PayloadNarrow4> {
+    static uint32_t pack(uint64_t s) noexcept { return static_cast<uint32_t>(s); }
+};
+} // namespace zrqueue

@@ -56,6 +56,43 @@
 #endif
 
 static double g_ns_per_tsc = 1.0;
+
+// Mirror payload-source diagnosis payloads. Both are trivially copyable and
+// constructed with narrow stores, which defeats store-to-load forwarding when
+// the mirror reads the payload back out of the slot.
+struct BenchNarrow4 {
+    unsigned char a, b, c, d;
+    BenchNarrow4(uint64_t s = 0) noexcept { fill(s); }
+    void fill(uint64_t s) noexcept {
+        a = static_cast<unsigned char>(s);
+        b = static_cast<unsigned char>(s >> 8);
+        c = static_cast<unsigned char>(s >> 16);
+        d = static_cast<unsigned char>(s >> 24);
+    }
+    uint32_t bits() const noexcept {
+        return static_cast<uint32_t>(a) | (static_cast<uint32_t>(b) << 8) |
+               (static_cast<uint32_t>(c) << 16) | (static_cast<uint32_t>(d) << 24);
+    }
+};
+static_assert(sizeof(BenchNarrow4) == 4, "BenchNarrow4 must be 4 bytes");
+static_assert(std::is_trivially_copyable_v<BenchNarrow4>, "BenchNarrow4 must be trivially copyable");
+
+struct BenchTwo32 {
+    uint32_t lo, hi;
+    BenchTwo32(uint64_t s = 0) noexcept
+        : lo(static_cast<uint32_t>(s)), hi(static_cast<uint32_t>(s >> 32)) {}
+    uint64_t bits() const noexcept { return (static_cast<uint64_t>(hi) << 32) | lo; }
+};
+static_assert(sizeof(BenchTwo32) == 8, "BenchTwo32 must be 8 bytes");
+static_assert(std::is_trivially_copyable_v<BenchTwo32>, "BenchTwo32 must be trivially copyable");
+
+namespace zrqueue {
+template <>
+struct mirror_traits<BenchTwo32> {
+    static constexpr bool enable_4b = false;
+    static constexpr bool enable_8b = true;
+};
+} // namespace zrqueue
 static std::atomic<bool> g_realtime{ false };
 
 // ========== Cross-Platform Thread Pinning (CPU Affinity) ==========
@@ -179,7 +216,7 @@ template <uint32_t Cap>
 static void runThroughputSuite(int cpu1, int cpu2, const char* note) {
     std::printf("\n=== Throughput: capacity %u (%s), %lld iters x %d reps interleaved ===\n",
                 Cap, note, (long long)TPUT_ITERS, TPUT_REPS);
-    Stats sRig, sHeap, sInline, sMirror, sRing, sRingBulk, sHeapBulk;
+    Stats sRig, sHeap, sInline, sMirror, sRing, sRingValue, sRingBulk, sHeapBulk;
 
     for (int rep = 0; rep < TPUT_REPS; ++rep) {
         {
@@ -233,6 +270,18 @@ static void runThroughputSuite(int cpu1, int cpu2, const char* note) {
                           int* f;
                           while ((f = q->front()) == nullptr) {}
                           if (*f != static_cast<int>(i)) orderViolation("SpscRingBuffer");
+                          q->pop(); } }));
+            delete q;
+        }
+        {   // RingBuffer value fast path: direct slot assignment, no writer lambda
+            auto* q = new zrqueue::SpscRingBuffer<int, Cap>();
+            sRingValue.add(runThroughput(TPUT_ITERS, cpu1, cpu2,
+                [&] { for (int64_t i = 0; i < TPUT_ITERS; ++i)
+                          q->push_value(static_cast<int>(i)); },
+                [&] { for (int64_t i = 0; i < TPUT_ITERS; ++i) {
+                          int* f;
+                          while ((f = q->front()) == nullptr) {}
+                          if (*f != static_cast<int>(i)) orderViolation("SpscRingBuffer value");
                           q->pop(); } }));
             delete q;
         }
@@ -290,6 +339,7 @@ static void runThroughputSuite(int cpu1, int cpu2, const char* note) {
     sInline.report("InlineQueue emplace/front/pop", "ops/ms");
     sMirror.report("MirrorQueue emplace/front/pop", "ops/ms");
     sRing.report("RingBuffer alloc/write/push", "ops/ms");
+    sRingValue.report("RingBuffer push_value", "ops/ms");
     sRingBulk.report("RingBuffer alloc_bulk/commit x64", "ops/ms");
     sHeapBulk.report("HeapQueue push_bulk/consume_bulk x64", "ops/ms");
 }
@@ -301,7 +351,7 @@ template <uint32_t Cap>
 static void runRttSuite(int cpu1, int cpu2, const char* note) {
     std::printf("\n=== Round-trip latency: capacity %u (%s), %lld RTTs x %d reps interleaved ===\n",
                 Cap, note, (long long)RTT_ITERS, RTT_REPS);
-    Stats sRig, sHeap, sInline, sMirror, sRing;
+    Stats sRig, sHeap, sInline, sMirror, sRing, sRingValue;
 
     for (int rep = 0; rep < RTT_REPS; ++rep) {
         {
@@ -378,6 +428,22 @@ static void runRttSuite(int cpu1, int cpu2, const char* note) {
             delete a;
             delete b;
         }
+        {
+            auto* a = new zrqueue::SpscRingBuffer<int, Cap>();
+            auto* b = new zrqueue::SpscRingBuffer<int, Cap>();
+            sRingValue.add(static_cast<double>(runRtt(RTT_ITERS, cpu1, cpu2,
+                [&] { for (int64_t i = 0; i < RTT_ITERS; ++i) {
+                          a->push_value(static_cast<int>(i));
+                          while (!b->front()) {}
+                          b->pop(); } },
+                [&] { for (int64_t i = 0; i < RTT_ITERS; ++i) {
+                          int* f;
+                          while ((f = a->front()) == nullptr) {}
+                          b->push_value(*f);
+                          a->pop(); } })));
+            delete a;
+            delete b;
+        }
     }
 
     sRig.report("rigtorp", "ns RTT");
@@ -385,6 +451,7 @@ static void runRttSuite(int cpu1, int cpu2, const char* note) {
     sInline.report("InlineQueue", "ns RTT");
     sMirror.report("MirrorQueue", "ns RTT");
     sRing.report("RingBuffer", "ns RTT");
+    sRingValue.report("RingBuffer push_value", "ns RTT");
 }
 
 // ---------------------------------------------------------------------------
@@ -948,6 +1015,58 @@ static void runRingPathDiag(int cpu1, int cpu2) {
     }
 }
 
+// Compares the default mirror read-back against the explicit packed-payload
+// API and a classic heap queue for a type whose constructor emits narrow stores.
+template <typename T, typename Pack>
+static void runPackedApiCase(const char* label, Pack pack, int cpu1, int cpu2) {
+    constexpr int64_t kIters = 2000000;
+    constexpr int kReps = 3;
+    std::array<Stats, 3> st;
+
+    auto measure = [&](int v) -> double {
+        if (v == 2) {
+            zrqueue::SpscHeapQueue<T> q(4096);
+            return runThroughputSynced(kIters, cpu1, cpu2,
+                [&] { for (int64_t i = 0; i < kIters; ++i)
+                          q.emplace(static_cast<uint64_t>(i)); },
+                [&] { for (int64_t i = 0; i < kIters; ++i) {
+                          T* f;
+                          while ((f = q.front()) == nullptr) {}
+                          if (f->bits() != static_cast<uint64_t>(i)) orderViolation(label);
+                          q.pop(); } });
+        }
+        auto* q = new zrqueue::SpscMirrorQueue<T, 4096>();
+        const double r = runThroughputSynced(kIters, cpu1, cpu2,
+            [&] { for (int64_t i = 0; i < kIters; ++i) {
+                      if (v == 0) {
+                          q->emplace(static_cast<uint64_t>(i));
+                      } else {
+                          q->emplace_packed(pack(static_cast<uint64_t>(i)),
+                                            static_cast<uint64_t>(i));
+                      }
+                  } },
+            [&] { for (int64_t i = 0; i < kIters; ++i) {
+                      T* f;
+                      while ((f = q->front()) == nullptr) {}
+                      if (f->bits() != static_cast<uint64_t>(i)) orderViolation(label);
+                      q->pop(); } });
+        delete q;
+        return r;
+    };
+
+    for (int rep = 0; rep < kReps; ++rep) {
+        for (int pos = 0; pos < 3; ++pos) {
+            const int v = (pos + rep) % 3;
+            st[v].add(measure(v));
+        }
+    }
+    static const char* names[3] = { "mirror read-back", "mirror emplace_packed", "classic heap" };
+    std::printf("  %s\n", label);
+    for (int v = 0; v < 3; ++v) {
+        std::printf("    %-24s median=%9.0f ops/ms\n", names[v], medianOf(st[v].samples));
+    }
+}
+
 static void printUsage(const char* exe) {
     std::printf(
         "Usage: %s [consumer-core producer-core] [options]\n"
@@ -970,7 +1089,8 @@ static void printUsage(const char* exe) {
         "\n"
         "Suites (default: all of them):\n"
         "  throughput + RTT at capacities 4096 and 16M\n"
-        "  payload length sweep 4B..1KB plus a non-POD row\n"
+        "  payload length sweep 4B..1KB plus 8B scalar mirror/classic and non-POD rows\n"
+        "  mirror payload-source diagnosis (narrow-store constructors)\n"
         "  controlled-backlog sweep and RingBuffer producer-path diagnosis\n"
         "  RTT percentiles p50/p90/p99/p99.9 (one TSC read per RTT)\n"
         "\n"
@@ -1077,6 +1197,8 @@ int main(int argc, char* argv[]) {
     std::printf("  bytes     iters   rigtorp      Heap    Inline    Mirror      Ring   Ring/rig  note\n");
     runPayloadSuite<PayloadSized<4>, 4>(cpu1, cpu2, "4B", 5000000);
     runPayloadSuite<PayloadSized<8>, 8>(cpu1, cpu2, "8B", 5000000);
+    runPayloadSuite<PayloadScalar8, 8>(cpu1, cpu2, "8B scalar (mirror)", 5000000);
+    runPayloadSuite<PayloadScalar8Classic, 8>(cpu1, cpu2, "8B scalar (classic)", 5000000);
     runPayloadSuite<PayloadSized<16>, 16>(cpu1, cpu2, "16B", 5000000);
     runPayloadSuite<PayloadSized<32>, 32>(cpu1, cpu2, "32B", 5000000);
     runPayloadSuite<PayloadSized<64>, 64>(cpu1, cpu2, "64B", 2000000);
@@ -1085,6 +1207,10 @@ int main(int argc, char* argv[]) {
     runPayloadSuite<PayloadSized<512>, 512>(cpu1, cpu2, "512B", 1000000);
     runPayloadSuite<PayloadSized<1024>, 1024>(cpu1, cpu2, "1KB", 500000);
     runPayloadSuite<PayloadNonPod, sizeof(PayloadNonPod)>(cpu1, cpu2, "non-POD", 2000000);
+
+    std::printf("\n=== Mirror payload-source diagnosis: narrow-store constructors ===\n");
+    runPackedApiCase<BenchNarrow4>("4B narrow-store", [](uint64_t i) { return static_cast<uint32_t>(i); }, cpu1, cpu2);
+    runPackedApiCase<BenchTwo32>("8B narrow-store", [](uint64_t i) { return i; }, cpu1, cpu2);
     }
 
     // Credit is amortized over 16 items, so depths below 32 would deadlock.
@@ -1107,6 +1233,8 @@ int main(int argc, char* argv[]) {
     std::printf("  bytes     iters  model        p50     p90     p99   p99.9   p99/p50  note\n");
     runPayloadRttPercentiles<PayloadSized<4>, 4>(cpu1, cpu2, "4B", 500000);
     runPayloadRttPercentiles<PayloadSized<8>, 8>(cpu1, cpu2, "8B", 500000);
+    runPayloadRttPercentiles<PayloadScalar8, 8>(cpu1, cpu2, "8B scalar (mirror)", 500000);
+    runPayloadRttPercentiles<PayloadScalar8Classic, 8>(cpu1, cpu2, "8B scalar (classic)", 500000);
     runPayloadRttPercentiles<PayloadSized<16>, 16>(cpu1, cpu2, "16B", 400000);
     runPayloadRttPercentiles<PayloadSized<32>, 32>(cpu1, cpu2, "32B", 300000);
     runPayloadRttPercentiles<PayloadSized<64>, 64>(cpu1, cpu2, "64B", 200000);
