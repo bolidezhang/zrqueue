@@ -48,6 +48,21 @@ struct MirrorDefault8 {
 };
 static_assert(sizeof(MirrorDefault8) == 8, "MirrorDefault8 must be 8 bytes");
 
+// 8 B type that opts in by inheriting mirror_traits_defaults and overriding a
+// single flag. Before the defaults base existed this was a compile error.
+struct MirrorInherit8 {
+    uint64_t v;
+    MirrorInherit8(uint64_t s = 0) noexcept : v(s) {}
+};
+static_assert(sizeof(MirrorInherit8) == 8, "MirrorInherit8 must be 8 bytes");
+
+namespace zrqueue {
+template <>
+struct mirror_traits<MirrorInherit8> : mirror_traits_defaults<MirrorInherit8> {
+    static constexpr bool enable_8b = true;
+};
+} // namespace zrqueue
+
 namespace {
 
 int g_checks = 0;
@@ -692,6 +707,17 @@ int runDeathChild(const char* name) {
     } else if (!std::strcmp(name, "commit_without_claim")) {
         zrqueue::SpscRingBuffer<int, 8> q;
         q.commit(1);
+    } else if (!std::strcmp(name, "packed_payload_mismatch")) {
+        zrqueue::SpscMirrorQueue<uint32_t, 8> q;
+        q.emplace_packed(0x22222222u, 0x11111111u); // payload != object bytes
+    } else if (!std::strcmp(name, "push_value_over_pending_claim")) {
+        // Large T routes push_value() through spin_alloc(); with an uncommitted
+        // claim outstanding that must abort in every build, not clobber it.
+        struct Big { char buf[256]; };
+        zrqueue::SpscRingBuffer<Big, 8> q;
+        (void)q.alloc();
+        Big v{};
+        q.push_value(v);
     } else {
         return 2;
     }
@@ -945,6 +971,80 @@ void testMirrorPolicyFallback() {
     }
 }
 
+// The checked payload API derives the mirror payload from a T instance, so it
+// cannot disagree with the object and cannot be narrowed.
+void testMirrorPushPayload() {
+    // 4 B: push_payload / try_push_payload agree with the slot value.
+    {
+        using Q = zrqueue::SpscMirrorQueue<uint32_t, 8>;
+        Q q;
+        for (uint32_t i = 0; i < 8; ++i) {
+            CHECK(q.try_push_payload(0x80000000u | i));
+        }
+        CHECK(!q.try_push_payload(0u)); // full
+        for (uint32_t i = 0; i < 8; ++i) {
+            uint32_t* f = q.front();
+            CHECK(f != nullptr);
+            if (f) {
+                CHECK(*f == (0x80000000u | i));
+            }
+            CHECK(q.peek(0) == nullptr || *q.peek(0) == *f);
+            q.pop();
+        }
+        CHECK(q.empty());
+        q.push_payload(0xDEADBEEFu);
+        CHECK(*q.front() == 0xDEADBEEFu);
+        q.pop();
+        CHECK(q.empty());
+    }
+    // 8 B seqlock path: the derived payload survives the double-load.
+    {
+        using Q = zrqueue::SpscMirrorQueue<uint64_t, 8>;
+        static_assert(Q::mirror_enabled, "uint64_t must use the 8 B mirror");
+        Q q;
+        const uint64_t v = 0x1122334455667788ull;
+        q.push_payload(v);
+        uint64_t* f = q.front();
+        CHECK(f != nullptr);
+        if (f) {
+            CHECK(*f == v);
+        }
+        q.pop();
+        CHECK(q.empty());
+    }
+    // Constructing from an argument (not a T instance) also derives the payload.
+    {
+        using Q = zrqueue::SpscMirrorQueue<uint32_t, 4>;
+        Q q;
+        q.push_payload(1234u);
+        uint32_t* f = q.front();
+        CHECK(f != nullptr);
+        if (f) {
+            CHECK(*f == 1234u);
+        }
+        q.pop();
+        CHECK(q.empty());
+    }
+}
+
+// A type that opts in via mirror_traits_defaults (plan B): only enable_8b is
+// written, enable_4b comes from the base.
+void testMirrorTraitsInheritance() {
+    using Q = zrqueue::SpscMirrorQueue<MirrorInherit8, 8>;
+    static_assert(Q::mirror_enabled, "MirrorInherit8 must opt in through the defaults base");
+    static_assert(Q::mirror_window == 2, "8 B mirror window must be 2");
+    Q q;
+    const uint64_t v = 0xCAFEBABEDEADBEEFull;
+    q.push_payload(MirrorInherit8{v});
+    MirrorInherit8* f = q.front();
+    CHECK(f != nullptr);
+    if (f) {
+        CHECK(f->v == v);
+    }
+    q.pop();
+    CHECK(q.empty());
+}
+
 void testMirrorConsumeBulk() {
     // Empty queue: nothing consumed, indices untouched.
     {
@@ -1009,6 +1109,42 @@ void testMirrorConsumeBulk() {
             CHECK(n == 4);
             CHECK(expect == round * 4 + 4);
         }
+        CHECK(q.empty());
+    }
+    // Deep backlog drained one element at a time: `available` far exceeds the
+    // window but each run's `count` is 1, so the mirror is still probed (plan D -
+    // gating on `available` would have skipped it). Values must stay in order.
+    {
+        zrqueue::SpscMirrorQueue<uint32_t, 64> q;
+        for (uint32_t i = 0; i < 8; ++i) {
+            q.emplace(100u + i);
+        }
+        bool ok = true;
+        for (uint32_t i = 0; i < 8; ++i) {
+            uint32_t seen = 0;
+            const size_t n = q.consume_bulk([&](uint32_t& v) noexcept { seen = v; }, 1);
+            if (n != 1 || seen != 100u + i) {
+                ok = false;
+            }
+        }
+        CHECK(ok);
+        CHECK(q.empty());
+    }
+    // Same shape on the 8 B seqlock path.
+    {
+        zrqueue::SpscMirrorQueue<uint64_t, 64> q;
+        for (uint64_t i = 0; i < 6; ++i) {
+            q.emplace(0x1000ull + i);
+        }
+        bool ok = true;
+        for (uint64_t i = 0; i < 6; ++i) {
+            uint64_t seen = 0;
+            const size_t n = q.consume_bulk([&](uint64_t& v) noexcept { seen = v; }, 1);
+            if (n != 1 || seen != 0x1000ull + i) {
+                ok = false;
+            }
+        }
+        CHECK(ok);
         CHECK(q.empty());
     }
     // Stale cached producer index: after a partial drain, cached_write_index_
@@ -1240,9 +1376,18 @@ void testRingValuePush() {
 void testDeathCases(const char* self) {
     static const char* cases[] = {
         "double_alloc", "double_spin_alloc", "bulk_then_push",
-        "over_commit", "commit_without_claim"
+        "over_commit", "commit_without_claim", "packed_payload_mismatch",
+        "push_value_over_pending_claim"
     };
     for (const char* c : cases) {
+        // The claim/commit detectors (and push_value's claim guard) are Debug-only:
+        // keeping them live in Release cost a 10x throughput regression on the 4 B
+        // RingBuffer path, so Release builds are silent by design.
+#ifdef NDEBUG
+        if (!std::strcmp(c, "push_value_over_pending_claim")) {
+            continue;
+        }
+#endif
         ++g_checks;
         if (!expectAbort(self, c)) {
             ++g_failures;
@@ -1317,6 +1462,8 @@ int main(int argc, char* argv[]) {
     testMirrorDisabledPath<MirrorOptOut4>();
     testMirrorDisabledPath<MirrorDefault8>();
     testMirrorPolicyFallback();
+    testMirrorPushPayload();
+    testMirrorTraitsInheritance();
     testRingValuePush();
     testMirrorConsumeBulk();
     testMirrorPushBulk();

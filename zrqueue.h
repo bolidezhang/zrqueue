@@ -49,7 +49,7 @@ SOFTWARE.
     #error "zrqueue requires if constexpr (__cpp_if_constexpr missing)"
 #endif
 
-#define ZRQUEUE_VERSION 11000   //1.10.0
+#define ZRQUEUE_VERSION 11100   //1.11.0
 
 #include <atomic>
 #include <array>
@@ -1214,6 +1214,9 @@ namespace zrqueue {
         template <typename P, typename = std::enable_if_t<std::is_assignable_v<T&, P&&>>>
         ZRQUEUE_FORCE_INLINE void push_value(P&& v) noexcept(std::is_nothrow_assignable_v<T&, P&&>) {
             if constexpr (sizeof(T) > ZRQUEUE_CACHE_LINE_SIZE) {
+                // Multi-cache-line payloads: the try_push_value loop's bool return and
+                // failure path cost a stack frame and register spills, so route through
+                // the straight-line spin_alloc claim instead (same reason as push(Writer)).
                 T* slot = spin_alloc();
                 *slot = std::forward<P>(v);
                 push();
@@ -1420,16 +1423,23 @@ namespace zrqueue {
     //          double, ...). Custom 8 B structs fall back to the classic path
     //          unless they opt in.
     // The 8 B seqlock writes two 8 B words into the index line, so it trades
-    // roughly 20% saturated throughput for roughly 20% lower RTT. Disable it
-    // for a throughput-only queue by specializing mirror_traits<T>::enable_8b
-    // to false (the 4 B path and classic protocol are unaffected).
-    // Specialize BOTH flags (an explicit specialization does not inherit the
-    // primary template's defaults):
+    // roughly 20% saturated throughput for roughly 20% lower RTT - and only while
+    // the backlog stays inside its 2-element window (see README). Disable it for
+    // a throughput-only queue by setting enable_8b to false (the 4 B path and the
+    // classic protocol are unaffected).
     //
-    //   template <> struct zrqueue::mirror_traits<MyTick8> {
-    //       static constexpr bool enable_4b = false;
+    // To opt a custom type in, inherit from mirror_traits_defaults<T> so the flags
+    // you do not mention keep their defaults:
+    //
+    //   template <> struct zrqueue::mirror_traits<MyTick8>
+    //       : zrqueue::mirror_traits_defaults<MyTick8> {
     //       static constexpr bool enable_8b = true;
     //   };
+    //
+    // An explicit specialization does NOT inherit the primary template, so writing
+    // only one flag there is a compile error (the missing one is undefined). The
+    // static_assert below turns that into a readable message instead of a "not a
+    // member of" error pointing into this header.
     //
     // mirror_codec<T> is an optional second customization point. If a
     // specialization provides `static <payload_type> pack(Arg&...)`, emplace()
@@ -1441,10 +1451,37 @@ namespace zrqueue {
     // arguments; it receives lvalue references and runs before the slot is
     // constructed.
     template <typename T>
-    struct mirror_traits {
+    struct mirror_traits_defaults {
         static constexpr bool enable_4b = true;
         static constexpr bool enable_8b = std::is_arithmetic_v<T>;
     };
+
+    namespace mirror_detail {
+        template <typename U, typename = void>
+        struct has_enable_4b : std::false_type {};
+        template <typename U>
+        struct has_enable_4b<U, std::void_t<decltype(U::enable_4b)>> : std::true_type {};
+
+        template <typename U, typename = void>
+        struct has_enable_8b : std::false_type {};
+        template <typename U>
+        struct has_enable_8b<U, std::void_t<decltype(U::enable_8b)>> : std::true_type {};
+
+        // Instantiated from SpscMirrorQueue's static_assert, so the message below
+        // fires at the point of use with a readable reason.
+        template <typename U>
+        struct traits_complete {
+            static_assert(has_enable_4b<U>::value && has_enable_8b<U>::value,
+                          "mirror_traits<T> must define BOTH enable_4b and enable_8b. "
+                          "An explicit specialization does not inherit the primary template: "
+                          "inherit from zrqueue::mirror_traits_defaults<T> and override only "
+                          "the flag you need.");
+            static constexpr bool value = true;
+        };
+    } // namespace mirror_detail
+
+    template <typename T>
+    struct mirror_traits : mirror_traits_defaults<T> {};
 
     template <typename T>
     using mirror_payload_t = std::conditional_t<(sizeof(T) <= 4), uint32_t, uint64_t>;
@@ -1513,6 +1550,11 @@ namespace zrqueue {
 
         static constexpr uint32_t MASK = N - 1;
 
+        // Surfaces a readable error when mirror_traits<T> was specialised with only
+        // one of the two flags (see the policy comment above).
+        static_assert(mirror_detail::traits_complete<mirror_traits<T>>::value,
+                      "mirror_traits<T> is missing a flag");
+
         static constexpr bool MIRROR_4 =
             std::is_trivially_copyable_v<T> && sizeof(T) <= 4 && alignof(T) <= 8 &&
             mirror_traits<T>::enable_4b;
@@ -1522,6 +1564,12 @@ namespace zrqueue {
         static constexpr bool MIRROR_OK = MIRROR_4 || MIRROR_8;
         static constexpr size_t MIRROR_K = MIRROR_8 ? 2 : (MIRROR_4 ? 4 : 1);
         static constexpr size_t MIRROR_MASK = MIRROR_K - 1;
+        // Sentinel seq meaning "no element here". It is UINT32_MAX, which is a valid
+        // low half of a real write_index, so an element whose index is exactly
+        // 0xFFFFFFFF would be indistinguishable from an empty entry and simply miss
+        // the mirror (the consumer falls back to the authoritative slot, so the value
+        // is still correct). Reaching it needs 2^32 pushes on one queue instance -
+        // the wrap is harmless, not a correctness gap.
         static constexpr uint64_t EMPTY_ENTRY_4B = 0xFFFFFFFF00000000ULL; // seq = UINT32_MAX
 
         struct MirrorEntry8 {
@@ -1641,7 +1689,18 @@ namespace zrqueue {
         // the constructed T, so publication never depends on reading the slot
         // back. Required for custom types whose constructor emits narrow stores;
         // otherwise the mirror read-back can cost 3-7x throughput.
+        //
         // Contract: payload must equal the byte representation of T(args...).
+        // This cannot be checked at compile time - payload_type is a plain integer
+        // and the correct value depends on the arguments. Three failure modes:
+        //   - a payload that disagrees with the object (front() then returns the
+        //     mirror value while the slot holds something else),
+        //   - an implicit narrowing conversion for a 4 B T (silently keeps the low
+        //     32 bits).
+        // Debug builds therefore verify the payload against the constructed slot
+        // and abort on a mismatch (see verify_payload). For a checked call in any
+        // build, prefer push_payload(value) / try_push_payload(value), which
+        // derives the payload from a T instance and is immune to both.
         // --------------------------------------------------------------------
         template <typename... Args>
         ZRQUEUE_FORCE_INLINE void emplace_packed(payload_type payload, Args&&... args) noexcept(std::is_nothrow_constructible_v<T, Args&&...>) {
@@ -1655,7 +1714,9 @@ namespace zrqueue {
                 ZRQUEUE_CPU_PAUSE();
             }
 
-            new (slot_at(write_index)) T(std::forward<Args>(args)...);
+            T* slot = slot_at(write_index);
+            new (slot) T(std::forward<Args>(args)...);
+            verify_payload(payload, slot);
             mirror_store(write_index, payload);
             write_index_.store(next_write_index, std::memory_order_release);
         }
@@ -1674,7 +1735,9 @@ namespace zrqueue {
                 }
             }
 
-            new (slot_at(write_index)) T(std::forward<Args>(args)...);
+            T* slot = slot_at(write_index);
+            new (slot) T(std::forward<Args>(args)...);
+            verify_payload(payload, slot);
             mirror_store(write_index, payload);
             write_index_.store(next_write_index, std::memory_order_release);
             return true;
@@ -1716,12 +1779,48 @@ namespace zrqueue {
             return try_emplace_packed(payload, std::forward<P>(v));
         }
 
+        // Checked variant: the payload is derived from a T instance, so it always
+        // equals the object representation and cannot be narrowed. Use this when
+        // the value is already materialised; use emplace_packed() to construct the
+        // element in place from its arguments.
+        ZRQUEUE_FORCE_INLINE void push_payload(const T& v) noexcept(std::is_nothrow_copy_constructible_v<T>) {
+            static_assert(MIRROR_OK, "push_payload requires a mirror-eligible T (see mirror_traits)");
+            emplace_packed(payload_of(v), v);
+        }
+
+        template <typename P, typename = std::enable_if_t<std::is_constructible_v<T, P&&> &&
+                                                          !std::is_same_v<std::decay_t<P>, T>>>
+        ZRQUEUE_FORCE_INLINE void push_payload(P&& v) noexcept(std::is_nothrow_constructible_v<T, P&&>) {
+            static_assert(MIRROR_OK, "push_payload requires a mirror-eligible T (see mirror_traits)");
+            const T tmp(std::forward<P>(v));
+            emplace_packed(payload_of(tmp), tmp);
+        }
+
+        ZRQUEUE_NODISCARD ZRQUEUE_FORCE_INLINE bool try_push_payload(const T& v) noexcept(std::is_nothrow_copy_constructible_v<T>) {
+            static_assert(MIRROR_OK, "try_push_payload requires a mirror-eligible T (see mirror_traits)");
+            return try_emplace_packed(payload_of(v), v);
+        }
+
+        template <typename P, typename = std::enable_if_t<std::is_constructible_v<T, P&&> &&
+                                                          !std::is_same_v<std::decay_t<P>, T>>>
+        ZRQUEUE_NODISCARD ZRQUEUE_FORCE_INLINE bool try_push_payload(P&& v) noexcept(std::is_nothrow_constructible_v<T, P&&>) {
+            static_assert(MIRROR_OK, "try_push_payload requires a mirror-eligible T (see mirror_traits)");
+            const T tmp(std::forward<P>(v));
+            return try_emplace_packed(payload_of(tmp), tmp);
+        }
+
         // ------------------------------------------------------------------------
         // Bulk Push: construct up to `count` elements from an iterator and publish
         // them with ONE release store instead of one per element. Returns the
         // number actually written (partial push when the queue cannot fit the
         // whole run; 0 when full). Same signature and contract as
         // SpscHeapQueue::push_bulk / SpscInlineQueue::push_bulk.
+        //
+        // The return value is a conservative LOWER bound on the free space: the
+        // space is computed from cached_read_index_, a stale copy of the consumer's
+        // index, so it can only under-estimate. Refreshing it costs a cross-core load
+        // that is not worth it here - callers loop on the return value anyway. So
+        // "pushed < count" means "the queue may be full", not "it is definitely full".
         //
         // Mirror behaviour: entries are written only for elements that stay inside
         // the K-element window (the last K of the run). The consumer can only use
@@ -1859,13 +1958,15 @@ namespace zrqueue {
                                      ? static_cast<size_t>(available)
                                      : max_count;
 
-            // Mirror entries are only meaningful while the whole run fits the
-            // window: entry i is overwritten once the producer is more than
-            // MIRROR_K elements ahead, and a burst drain usually is. Skipping the
-            // per-element mirror probe in that case is what keeps this loop at
-            // parity with the manual front()/pop() drain (a probe that must miss
-            // is pure overhead - measured 16% slower without this guard).
-            const bool probe_mirror = MIRROR_OK && available <= MIRROR_K;
+            // Mirror entries are only meaningful while the run being drained fits the
+            // window: entry i is overwritten once the producer is more than MIRROR_K
+            // elements ahead, and a burst drain usually is. Skipping the per-element
+            // mirror probe in that case is what keeps this loop at parity with the
+            // manual front()/pop() drain (a probe that must miss is pure overhead -
+            // measured 16% slower without this guard). Gate on `count`, the number of
+            // elements actually drained, not on `available`: a capped drain
+            // (max_count < available) can still stay inside the window.
+            const bool probe_mirror = MIRROR_OK && count <= MIRROR_K;
 
             for (size_t i = 0; i < count; ++i) {
                 const uint64_t index = read_index + i;
@@ -1893,6 +1994,12 @@ namespace zrqueue {
 
         // Reads the authoritative slot directly (mirroring is a front()-path
         // optimization only); the slot is always valid for any in-queue element.
+        //
+        // The returned pointer is NOT necessarily the one front() would return for
+        // the same element: a mirror hit unpacks into the consumer's mirror_stash_
+        // and front() hands that out, while peek() always addresses the slot. The
+        // pointed-to VALUES are identical - only the addresses differ. Do not compare
+        // the two pointers, and do not cache a peek() pointer across a pop().
         ZRQUEUE_NODISCARD ZRQUEUE_FORCE_INLINE T* peek(size_t offset = 0) noexcept {
             const uint64_t read_index = read_index_.load(std::memory_order_relaxed);
             const uint64_t off = static_cast<uint64_t>(offset);
@@ -1930,6 +2037,31 @@ namespace zrqueue {
         ZRQUEUE_FORCE_INLINE T* slot_at(uint64_t index) noexcept {
             return &reinterpret_cast<T*>(slots_)[index & MASK];
         }
+
+        // Derives the mirror payload from an existing object. Same bytes the slot
+        // read-back would produce, but with no dependency on the slot's cache line
+        // and no possibility of a width mismatch.
+        static ZRQUEUE_FORCE_INLINE payload_type payload_of(const T& v) noexcept {
+            static_assert(sizeof(T) == sizeof(payload_type) || sizeof(T) < sizeof(payload_type),
+                          "payload_type must be able to hold T");
+            payload_type p = 0;
+            std::memcpy(&p, &v, sizeof(T));
+            return p;
+        }
+
+        // Debug-only contract check for the caller-supplied payload variants. A
+        // mismatch means the mirror would serve different bytes than the slot, so
+        // front() and peek() would disagree - fail loudly instead.
+#ifndef NDEBUG
+        static ZRQUEUE_FORCE_INLINE void verify_payload(payload_type payload, const T* slot) noexcept {
+            if (payload_of(*slot) != payload) {
+                assert(false && "emplace_packed: payload does not match the constructed object; "
+                                "use push_payload(value) to derive it automatically");
+            }
+        }
+#else
+        static ZRQUEUE_FORCE_INLINE void verify_payload(payload_type, const T*) noexcept {}
+#endif
 
         // Producer: pack a caller-supplied payload into the mirror entry.
         ZRQUEUE_FORCE_INLINE void mirror_store(uint64_t write_index, payload_type payload) noexcept {
