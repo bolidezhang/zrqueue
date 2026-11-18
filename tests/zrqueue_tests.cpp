@@ -1324,6 +1324,83 @@ void testMirrorPushBulk() {
     }
 }
 
+// The spin policy is a compile-time template parameter. Verify a custom policy is
+// instantiated and actually consulted, and that the built-in ones compile.
+struct CountingSpin {
+    static inline int calls = 0;
+    static void hint() noexcept {
+        ++calls;
+        ZRQUEUE_CPU_PAUSE();
+    }
+};
+
+void testSpinPolicy() {
+    // Default policy still works on every model (no template argument given).
+    {
+        zrqueue::SpscHeapQueue<int> h(8);
+        h.emplace(1);
+        CHECK(*h.front() == 1);
+        h.pop();
+
+        zrqueue::SpscInlineQueue<int, 8> i;
+        i.emplace(2);
+        CHECK(*i.front() == 2);
+        i.pop();
+
+        zrqueue::SpscRingBuffer<int, 8> r;
+        r.push([](int* p) { *p = 3; });
+        CHECK(*r.front() == 3);
+        r.pop();
+
+        zrqueue::SpscMirrorQueue<unsigned, 8> m;
+        m.emplace(4u);
+        CHECK(*m.front() == 4u);
+        m.pop();
+    }
+    // A custom policy is consulted when the queue actually blocks.
+    {
+        CountingSpin::calls = 0;
+        zrqueue::SpscHeapQueue<int, zrqueue::AlignedAllocator<int>, CountingSpin> q(2);
+        // Fill to capacity, then push from the same thread through a try_emplace
+        // loop: the blocking emplace would spin forever without a consumer, so
+        // drive spin_front from a second thread instead.
+        q.emplace(1);
+        q.emplace(2);
+        std::atomic<int> consumed{ 0 };
+        std::thread consumer([&] {
+            for (int i = 0; i < 2; ++i) {
+                int* f;
+                while ((f = q.spin_front()) == nullptr) {
+                }
+                q.pop();
+                ++consumed;
+            }
+        });
+        q.emplace(3);   // blocks until the consumer frees a slot
+        q.emplace(4);
+        consumer.join();
+        CHECK(consumed.load() == 2);
+        CHECK(CountingSpin::calls > 0);
+    }
+    // The other built-in policies instantiate on every model.
+    {
+        zrqueue::SpscInlineQueue<int, 8, zrqueue::SpinYield> a;
+        a.emplace(1);
+        CHECK(*a.front() == 1);
+        a.pop();
+
+        zrqueue::SpscRingBuffer<int, 8, zrqueue::SpinNothing> b;
+        b.push([](int* p) { *p = 2; });
+        CHECK(*b.front() == 2);
+        b.pop();
+
+        zrqueue::SpscMirrorQueue<unsigned, 8, zrqueue::SpinYield> c;
+        c.emplace(3u);
+        CHECK(*c.front() == 3u);
+        c.pop();
+    }
+}
+
 void testRingValuePush() {
     {
         zrqueue::SpscRingBuffer<int, 8> q;
@@ -1464,6 +1541,7 @@ int main(int argc, char* argv[]) {
     testMirrorPolicyFallback();
     testMirrorPushPayload();
     testMirrorTraitsInheritance();
+    testSpinPolicy();
     testRingValuePush();
     testMirrorConsumeBulk();
     testMirrorPushBulk();

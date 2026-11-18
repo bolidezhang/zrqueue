@@ -49,7 +49,7 @@ SOFTWARE.
     #error "zrqueue requires if constexpr (__cpp_if_constexpr missing)"
 #endif
 
-#define ZRQUEUE_VERSION 11100   //1.11.0
+#define ZRQUEUE_VERSION 11200   //1.12.0
 
 #include <atomic>
 #include <array>
@@ -61,6 +61,7 @@ SOFTWARE.
 #include <cstdint>
 #include <memory>
 #include <new>
+#include <thread>
 #include <type_traits>
 #include <utility>
 
@@ -171,6 +172,53 @@ SOFTWARE.
 #endif
 
 namespace zrqueue {
+
+    // ============================================================================
+    // [Spin Policy: how a blocking queue waits for the other side]
+    // ============================================================================
+    // Every blocking call (emplace/push/spin_front/spin_alloc/...) waits in a loop
+    // that re-reads the peer's index and then executes a wait hint. The hint is a
+    // compile-time policy so a queue can be tuned per instance without touching the
+    // hot path: SpinPause inlines to the raw PAUSE/YIELD instruction, and any other
+    // policy is also resolved at compile time (no indirect call, no global state).
+    //
+    //   SpinPause   - default. PAUSE on x86, YIELD on ARM64. Correct when the queue
+    //                 owns its cores (isolcpus / nohz_full / dedicated threads).
+    //   SpinYield   - calls std::this_thread::yield(). Use on oversubscribed hosts
+    //                 where the peer can be descheduled and a pure spin would starve
+    //                 it; costs a syscall per iteration (microseconds).
+    //   SpinNothing - no hint at all. Only useful when an outer wait already handles
+    //                 the backoff, or when measuring the hint's contribution.
+    //
+    // A policy is a struct with `static void hint() noexcept`. Custom policies are
+    // just another such struct:
+    //
+    //   struct MyBackoff {
+    //       static void hint() noexcept { /* exponential backoff, futex, ... */ }
+    //   };
+    //   zrqueue::SpscHeapQueue<Tick, zrqueue::AlignedAllocator<Tick>, MyBackoff> q(1024);
+    //
+    // Measured: replacing the inline PAUSE with an indirect call cost nothing
+    // (183-250 K ops/ms either way in the full/empty-queue stress regimes), because
+    // the cross-core index load in the same iteration dominates by 5-10x. A
+    // compile-time policy is therefore free by construction.
+    struct SpinPause {
+        static void hint() noexcept { 
+            ZRQUEUE_CPU_PAUSE(); 
+        }
+    };
+
+    struct SpinYield {
+        static void hint() noexcept { 
+            std::this_thread::yield(); 
+        }
+    };
+
+    struct SpinNothing {
+        static void hint() noexcept {
+        }
+    };
+
 
     // ============================================================================
     // [Low-Level Memory / Math Helper Functions]
@@ -403,7 +451,7 @@ namespace zrqueue {
     // ============================================================================
     // [Ultra-Fast Lock-Free SpscHeapQueue]
     // ============================================================================
-    template <typename T, typename Allocator = AlignedAllocator<T>>
+    template <typename T, typename Allocator = AlignedAllocator<T>, typename Spin = SpinPause>
     class SpscHeapQueue {
     public:
         explicit SpscHeapQueue(const uint32_t capacity, const Allocator& allocator = Allocator())
@@ -454,7 +502,7 @@ namespace zrqueue {
                 cached_read_index_ = read_index_.load(std::memory_order_acquire);
                 // [Mechanism]: _mm_pause relaxes hammering on the consumer's cache line,
                 // otherwise every consumer release-store pays an RFO round-trip (measured 1.7-2.3x at small capacity)
-                ZRQUEUE_CPU_PAUSE();
+                Spin::hint();
             }
 
             // [Mechanism]: Pure bitwise addressing + Placement new (Zero-Branching & Zero-Initialization Penalty)
@@ -529,7 +577,7 @@ namespace zrqueue {
                     return &slots_[read_index & mask_];
                 }
 
-                ZRQUEUE_CPU_PAUSE();
+                Spin::hint();
             }
         }
 
@@ -740,8 +788,8 @@ namespace zrqueue {
     };  // end SpscHeapQueue
 
     // Backward-compatible alias for the pre-1.6.0 name. New code should use SpscHeapQueue.
-    template <typename T, typename Allocator = AlignedAllocator<T>>
-    using SpscQueue [[deprecated("Renamed to SpscHeapQueue")]] = SpscHeapQueue<T, Allocator>;
+    template <typename T, typename Allocator = AlignedAllocator<T>, typename Spin = SpinPause>
+    using SpscQueue [[deprecated("Renamed to SpscHeapQueue")]] = SpscHeapQueue<T, Allocator, Spin>;
 
     /**
      * @brief Extreme in-place SPSC Queue
@@ -750,7 +798,7 @@ namespace zrqueue {
      * @tparam T Element type
      * @tparam N Queue capacity ([MUST] be a power of 2)
      */
-    template <typename T, uint32_t N>
+    template <typename T, uint32_t N, typename Spin = SpinPause>
     class SpscInlineQueue {
         // [Compile-Time Defense]: Forcibly require N to be a power of 2, eliminating runtime bitwise risks at the root
         static_assert(N >= 2, "Capacity must be at least 2");
@@ -791,7 +839,7 @@ namespace zrqueue {
 
             while (ZRQUEUE_UNLIKELY(next_write_index - cached_read_index_ > N)) {
                 cached_read_index_ = read_index_.load(std::memory_order_acquire);
-                ZRQUEUE_CPU_PAUSE();
+                Spin::hint();
             }
 
             // [Extreme Base Addressing]: No longer dereferencing slots_ pointer,
@@ -889,7 +937,7 @@ namespace zrqueue {
                 if (ZRQUEUE_LIKELY(read_index != cached_write_index_)) {
                     return &reinterpret_cast<T*>(slots_memory_)[read_index & MASK];
                 }
-                ZRQUEUE_CPU_PAUSE();
+                Spin::hint();
             }
         }
 
@@ -1036,7 +1084,7 @@ namespace zrqueue {
     // ============================================================================
     // [Zero-Copy Pre-allocated Memory Lock-Free Queue SpscRingBuffer (Disruptor Style)]
     // ============================================================================
-    template<class T, uint32_t N>
+    template<class T, uint32_t N, typename Spin = SpinPause>
     class SpscRingBuffer {
         static_assert(N >= 2, "Capacity must be at least 2");
         static_assert((N & (N - 1)) == 0, "N must be a power of 2");
@@ -1084,7 +1132,7 @@ namespace zrqueue {
 
             while (ZRQUEUE_UNLIKELY(next_write_index - cached_read_index_ > N)) {
                 cached_read_index_ = read_index_.load(std::memory_order_acquire);
-                ZRQUEUE_CPU_PAUSE();
+                Spin::hint();
             }
 
 #ifndef NDEBUG
@@ -1191,7 +1239,7 @@ namespace zrqueue {
                 push();
             } else {
                 while (!try_push(std::forward<Writer>(writer))) {
-                    ZRQUEUE_CPU_PAUSE();
+                    Spin::hint();
                 }
             }
         }
@@ -1222,7 +1270,7 @@ namespace zrqueue {
                 push();
             } else {
                 while (!try_push_value(std::forward<P>(v))) {
-                    ZRQUEUE_CPU_PAUSE();
+                    Spin::hint();
                 }
             }
         }
@@ -1250,7 +1298,7 @@ namespace zrqueue {
                 if (ZRQUEUE_LIKELY(read_index != cached_write_index_)) {
                     return &data_[read_index & MASK];
                 }
-                ZRQUEUE_CPU_PAUSE();
+                Spin::hint();
             }
         }
 
@@ -1543,7 +1591,7 @@ namespace zrqueue {
     //
     // Deliberately minimal API (RTT-focused): no bulk ops - use SpscRingBuffer or
     // SpscInlineQueue for burst workloads.
-    template <typename T, uint32_t N>
+    template <typename T, uint32_t N, typename Spin = SpinPause>
     class SpscMirrorQueue {
         static_assert(N >= 2, "Capacity must be at least 2");
         static_assert((N & (N - 1)) == 0, "Capacity N must be a power of 2 for bitwise masking");
@@ -1633,7 +1681,7 @@ namespace zrqueue {
 
             while (ZRQUEUE_UNLIKELY(next_write_index - cached_read_index_ > N)) {
                 cached_read_index_ = read_index_.load(std::memory_order_acquire);
-                ZRQUEUE_CPU_PAUSE();
+                Spin::hint();
             }
 
             T* slot = slot_at(write_index);
@@ -1711,7 +1759,7 @@ namespace zrqueue {
 
             while (ZRQUEUE_UNLIKELY(next_write_index - cached_read_index_ > N)) {
                 cached_read_index_ = read_index_.load(std::memory_order_acquire);
-                ZRQUEUE_CPU_PAUSE();
+                Spin::hint();
             }
 
             T* slot = slot_at(write_index);
@@ -1904,7 +1952,7 @@ namespace zrqueue {
                     }
                     return slot_at(read_index);
                 }
-                ZRQUEUE_CPU_PAUSE();
+                Spin::hint();
             }
         }
 

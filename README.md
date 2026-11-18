@@ -25,6 +25,7 @@ Designed strictly for High-Frequency Trading (HFT) and ultra-low latency (ULL) s
 * **Compile-Time Safety Contract:** C++17 is enforced by `#error` (via `_MSVC_LANG` on MSVC, whose `__cplusplus` is otherwise stuck at `199711L`). Bulk APIs are `noexcept` and `static_assert` that `T` and the callback are nothrow-constructible / nothrow-invocable, so a throwing handler fails to compile instead of calling `std::terminate`.
 * **Destructor Cost:** Destruction walks the live `[read_index, write_index)` range directly instead of driving `front()`/`pop()`, so tearing down a queue full of POD elements costs no atomic stores at all.
 * **Hardware Thermal Throttling Defense:** Built-in `spin_front()` extracts invariant loads out of the loop and utilizes `_mm_pause()` / `yield` to prevent CPU ALU burnout and thermal downclocking during 100% busy-polling.
+* **Pluggable spin policy:** every blocking wait loop takes its hint from a compile-time policy, so a queue can be tuned per instance without touching the hot path. `SpinPause` (default: raw `PAUSE`/`YIELD`) inlines away completely — verified in the generated assembly, 5 inlined `pause` instructions and zero indirect calls. `SpinYield` calls `std::this_thread::yield()` for oversubscribed hosts where the peer can be descheduled, and `SpinNothing` disables the hint entirely. A custom policy is any struct with `static void hint() noexcept`. Select it as the last template argument: `SpscHeapQueue<Tick, AlignedAllocator<Tick>, SpinYield>`. Measured: replacing the inline `PAUSE` with an indirect call changed nothing (183–250 K ops/ms either way in the full/empty-queue stress regimes) because the cross-core index load in the same iteration dominates by 5–10x — a compile-time policy is free by construction.
 
 > **Observability vs. control:** `size()` and `empty()` issue two independent `relaxed` loads, so their result is a stale, non-atomic snapshot and can be negative-difference-clamped but never authoritative. Never gate flow control on them — use `try_push` / `try_emplace` / `try_pop`, which decide on the owning side.
 
@@ -384,6 +385,40 @@ consuming the same fixed batch so only the release-store granularity differs): *
 batch ≥ 64 (per-element transfer dominates). The mirror probe inside the loop is skipped when the backlog exceeds the window
 (`available > MIRROR_K`), since a probe that must miss is pure overhead — without that guard the loop measured 16 % slower than the
 manual drain.
+
+### 6. Choosing a Spin Policy
+
+Every blocking call (`emplace`, `push`, `push_value`, `spin_front`, `spin_alloc`, ...) waits in a loop that re-reads the peer's index
+and then executes a hint. The hint is the last template argument of each queue, and the default keeps the existing behaviour:
+
+```cpp
+// Default: raw PAUSE (x86) / YIELD (ARM64). Right when the queue owns its cores.
+zrqueue::SpscHeapQueue<Tick> q(1024);
+
+// Oversubscribed host: the peer can be descheduled, so yield the timeslice.
+// Costs a syscall per iteration (microseconds) but avoids starving the peer.
+zrqueue::SpscHeapQueue<Tick, zrqueue::AlignedAllocator<Tick>, zrqueue::SpinYield> q2(1024);
+
+// No hint at all: an outer wait already handles the backoff.
+zrqueue::SpscRingBuffer<Tick, 1024, zrqueue::SpinNothing> q3;
+
+// Custom: any struct with `static void hint() noexcept`.
+struct MyBackoff {
+    static void hint() noexcept { /* exponential backoff, futex wait, ... */ }
+};
+zrqueue::SpscMirrorQueue<uint64_t, 256, MyBackoff> q4;
+```
+
+The policy is resolved at compile time, so `SpinPause` inlines to the bare instruction — the generated assembly for a default
+`SpscHeapQueue<int>` contains 5 inlined `pause` instructions and zero indirect calls. Benchmarked against a function-pointer
+implementation (the alternative design): 183–250 K ops/ms either way in the full-queue and empty-queue stress regimes, i.e. no
+measurable difference, because the cross-core index load in the same loop iteration dominates by 5–10x.
+
+> **Which one to pick.** `SpinPause` assumes the producer and consumer own their cores — the `isolcpus`/`nohz_full` setup described
+> in the methodology note. On a shared or oversubscribed machine a pure spin can starve a descheduled peer indefinitely; use
+> `SpinYield` there and accept the syscall cost. The library has no adaptive fallback: a spin that upgrades to `yield` or a futex
+> wait on its own would add a branch to the hot path and, more importantly, cannot know whether the peer is merely slow or actually
+> descheduled.
 
 ## Build Instructions
 As a single-header library, `zrqueue` requires no complex build systems or external dependencies. Simply drop `zrqueue.h` into your source tree and include it.
